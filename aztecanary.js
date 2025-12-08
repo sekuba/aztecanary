@@ -357,15 +357,26 @@ class Aztecanary {
         const epoch = slot / this.config.epochDuration;
 
         if (Number(block.number) % 10 === 0) {
-            let nextDutyMsg = "none";
-            if (this.nextDuty && this.nextDuty.slot !== null) {
-                const dutySlot = this.nextDuty.slot;
+            const nowTs = BigInt(block.timestamp);
+            let attMsg = "none";
+            if (this.nextDuty && this.nextDuty.currentlyAttesting) {
+                attMsg = "currently attesting";
+            } else if (this.nextDuty && this.nextDuty.attest && this.nextDuty.attest.slot !== null) {
+                const dutySlot = this.nextDuty.attest.slot;
                 const dutyTs = this.config.genesisTime + (dutySlot * this.config.slotDuration);
-                const nowTs = BigInt(block.timestamp);
                 const delta = dutyTs > nowTs ? Number(dutyTs - nowTs) : 0;
-                nextDutyMsg = `slot ${dutySlot.toString()} in ${delta}s`;
+                attMsg = `slot ${dutySlot.toString()} in ${delta}s`;
             }
-            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch} | Slot: ${slot} | NextDuty: ${nextDutyMsg}`);
+
+            let propMsg = "none";
+            if (this.nextDuty && this.nextDuty.propose && this.nextDuty.propose.slot !== null) {
+                const dutySlot = this.nextDuty.propose.slot;
+                const dutyTs = this.config.genesisTime + (dutySlot * this.config.slotDuration);
+                const delta = dutyTs > nowTs ? Number(dutyTs - nowTs) : 0;
+                propMsg = `slot ${dutySlot.toString()} by ${this.nextDuty.propose.sequencer || "unknown"} in ${delta}s`;
+            }
+
+            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch} | Slot: ${slot} | Attest: ${attMsg} | Propose: ${propMsg}`);
         }
 
         if (this.currentEpoch && this.currentEpoch !== epoch) {
@@ -374,10 +385,16 @@ class Aztecanary {
         this.currentEpoch = epoch;
 
         const dutyInfo = await this.predictDuties(epoch, slot);
-        const mergedNext = (dutyInfo && dutyInfo.nextDuty && dutyInfo.nextDuty.slot !== null)
-            ? dutyInfo.nextDuty
-            : (this.nextDuty && this.nextDuty.slot !== null ? this.nextDuty : { slot: null });
-        this.nextDuty = mergedNext;
+        const existing = this.nextDuty || { attest: { slot: null }, propose: { slot: null }, currentlyAttesting: false };
+        const mergeSlot = (prev, cur) => {
+            if (!cur || cur.slot === null) return (prev && prev.slot !== null && prev.slot >= slot) ? prev : { slot: null };
+            return cur;
+        };
+        this.nextDuty = {
+            attest: mergeSlot(existing.attest, dutyInfo.attest),
+            propose: mergeSlot(existing.propose, dutyInfo.propose),
+            currentlyAttesting: dutyInfo.currentlyAttesting
+        };
 
         // If no tracked sequencers in current committee and not forcing history, skip realtime event processing to save RPC.
         if (!processEvents || (dutyInfo && dutyInfo.currentTargets === 0)) return;
@@ -398,7 +415,13 @@ class Aztecanary {
     async predictDuties(currentEpoch, currentSlot) {
         const maxEpoch = BigInt(currentEpoch) + this.config.lag;
         let currentTargets = 0;
-        let nextDuty = (this.nextDuty && this.nextDuty.slot !== null) ? this.nextDuty : { slot: null, epoch: null };
+        let nextAttest = (this.nextDuty && this.nextDuty.attest && this.nextDuty.attest.slot !== null)
+            ? this.nextDuty.attest
+            : { slot: null, epoch: null };
+        let nextPropose = (this.nextDuty && this.nextDuty.propose && this.nextDuty.propose.slot !== null)
+            ? this.nextDuty.propose
+            : { slot: null, epoch: null, sequencer: null };
+        let currentlyAttesting = false;
 
         for (let e = BigInt(currentEpoch); e <= maxEpoch; e++) {
             const epochKey = e.toString();
@@ -413,13 +436,16 @@ class Aztecanary {
             const inCommittee = data.committee.filter(val => TARGET_SEQUENCERS.has(val));
             if (inCommittee.length > 0) {
                 log("COMMITTEE", `[${tag}] Epoch ${e}: Tracked sequencers in committee`, { count: inCommittee.length, validators: inCommittee });
-                if (isCurrent) currentTargets = inCommittee.length;
-                if (nextDuty.slot === null) {
+                if (isCurrent) {
+                    currentTargets = inCommittee.length;
+                    currentlyAttesting = true;
+                }
+                if (nextAttest.slot === null) {
                     const slotHint = isCurrent ? currentSlot : (e * this.config.epochDuration);
-                    nextDuty = { slot: slotHint, epoch: e };
+                    nextAttest = { slot: slotHint, epoch: e };
                 }
             } else {
-                if (isCurrent) log("WARN", `[${tag}] Epoch ${e}: No tracked sequencers in committee`);
+                if (isCurrent) log("INFO", `[${tag}] Epoch ${e}: No tracked sequencers in committee`);
             }
 
             const startSlot = e * this.config.epochDuration;
@@ -431,8 +457,8 @@ class Aztecanary {
                 const proposer = data.committee[Number(proposerIndex)];
 
                 if (TARGET_SEQUENCERS.has(proposer)) {
-                    if (nextDuty.slot === null && (!isCurrent || slot >= currentSlot)) {
-                        nextDuty = { slot, epoch: e };
+                    if ((nextPropose.slot === null || slot < nextPropose.slot) && (!isCurrent || slot >= currentSlot)) {
+                        nextPropose = { slot, epoch: e, sequencer: proposer };
                     }
                     const ts = this.config.genesisTime + (slot * this.config.slotDuration);
                     log("DUTY", `[${tag}] Proposer duty (tracked sequencer)`, {
@@ -443,7 +469,7 @@ class Aztecanary {
             }
             this.processedEpochs.add(epochKey);
         }
-        return { currentTargets, nextDuty };
+        return { currentTargets, attest: nextAttest, propose: nextPropose, currentlyAttesting };
     }
 
     async start() {
