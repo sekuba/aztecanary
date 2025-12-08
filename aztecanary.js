@@ -374,7 +374,10 @@ class Aztecanary {
         this.currentEpoch = epoch;
 
         const dutyInfo = await this.predictDuties(epoch, slot);
-        this.nextDuty = dutyInfo.nextDuty || { slot: null };
+        const mergedNext = (dutyInfo && dutyInfo.nextDuty && dutyInfo.nextDuty.slot !== null)
+            ? dutyInfo.nextDuty
+            : (this.nextDuty && this.nextDuty.slot !== null ? this.nextDuty : { slot: null });
+        this.nextDuty = mergedNext;
 
         // If no tracked sequencers in current committee and not forcing history, skip realtime event processing to save RPC.
         if (!processEvents || (dutyInfo && dutyInfo.currentTargets === 0)) return;
@@ -395,7 +398,7 @@ class Aztecanary {
     async predictDuties(currentEpoch, currentSlot) {
         const maxEpoch = BigInt(currentEpoch) + this.config.lag;
         let currentTargets = 0;
-        let nextDuty = { slot: null, epoch: null };
+        let nextDuty = (this.nextDuty && this.nextDuty.slot !== null) ? this.nextDuty : { slot: null, epoch: null };
 
         for (let e = BigInt(currentEpoch); e <= maxEpoch; e++) {
             const epochKey = e.toString();
