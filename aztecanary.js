@@ -1,15 +1,3 @@
-/**
- * aztecanary.js v6
- * 
- * Monitor for Aztec Sequencers.
- * 
- * Changelog:
- * - Added explicit tracking logs on startup.
- * - Added "PERF_CHECK" summary logs for visibility.
- * - Enabled verbose Attestation logs (OK/MISS).
- * - Refined committee matching logic.
- */
-
 const { ethers } = require("ethers");
 
 // --- Configuration ---
