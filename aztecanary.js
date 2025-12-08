@@ -14,8 +14,8 @@ const { ethers } = require("ethers");
 
 // --- Configuration ---
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8545";
-const HEALTH_CHECK_INTERVAL_BLOCKS = 50; 
-const HISTORY_LOOKBACK_BLOCKS = 300; 
+const HEALTH_CHECK_INTERVAL_BLOCKS = 50;
+const HISTORY_LOOKBACK_BLOCKS = 300;
 
 // Parse targets
 const rawTargets = (process.env.TARGETS || "").split(",");
@@ -55,6 +55,18 @@ function log(type, message, data = {}) {
     console.log(JSON.stringify({ timestamp: new Date().toISOString(), type, message, ...data }));
 }
 
+function shortAddr(addr) {
+    if (!addr || addr.length < 6) return addr || "";
+    return addr.slice(0, 6); // e.g., 0x0cdc
+}
+
+function formatDuration(seconds) {
+    const s = Math.max(0, Math.floor(seconds));
+    const m = Math.floor(s / 60);
+    const sec = s % 60;
+    return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
 function computeProposerIndex(epoch, slot, seed, committeeSize) {
     if (committeeSize === 0n) return 0n;
     const packed = ethers.AbiCoder.defaultAbiCoder().encode(
@@ -71,7 +83,7 @@ function decodeProposeFromTx(tx, rollupIface, multicallIface) {
         if (decoded && decoded.name === "propose") {
             return decoded;
         }
-    } catch (_) {}
+    } catch (_) { }
 
     // 2) Multicall wrappers (aggregate3 / aggregate3Value)
     try {
@@ -93,7 +105,7 @@ function decodeProposeFromTx(tx, rollupIface, multicallIface) {
                 }
             } catch (_) { continue; }
         }
-    } catch (_) {}
+    } catch (_) { }
 
     return null;
 }
@@ -102,9 +114,9 @@ function checkAttestation(signatureIndicesBytes, index) {
     const byteIndex = Math.floor(index / 8);
     const shift = 7 - (index % 8);
     const bytesBuffer = ethers.getBytes(signatureIndicesBytes);
-    
+
     if (byteIndex >= bytesBuffer.length) return false;
-    
+
     // Check if bit is set (bit 0 is MSB or LSB? Solidity bitmap usually: index 0 is 7th bit of byte 0)
     // Solidity: (uint8(bytes[byteIndex]) >> shift) & 1
     // shift = 7 - (index % 8)
@@ -119,20 +131,19 @@ class Aztecanary {
         this.rollup = new ethers.Contract(ROLLUP_ADDRESS, ROLLUP_ABI, this.provider);
         this.iface = new ethers.Interface(ROLLUP_ABI);
         this.mcIface = new ethers.Interface(MULTICALL_ABI);
-        
+
         this.config = {};
         this.processedEpochs = new Set();
-        this.epochCache = new Map(); 
+        this.epochCache = new Map();
         this.checkedL2Blocks = new Set();
-        this.nextDuty = { slot: null };
     }
 
     async init() {
         log("INFO", "Initializing...");
-        
+
         // Log tracked addresses to confirm config
-        log("CONFIG", `Tracking ${TARGET_SEQUENCERS.size} sequencers`, { 
-            targets: Array.from(TARGET_SEQUENCERS).map(a => `${a.slice(0,6)}...${a.slice(-4)}`) 
+        log("CONFIG", `Tracking ${TARGET_SEQUENCERS.size} sequencers`, {
+            targets: Array.from(TARGET_SEQUENCERS).map(a => `${a.slice(0, 6)}...${a.slice(-4)}`)
         });
 
         const [epochDuration, slotDuration, genesisTime, lag] = await Promise.all([
@@ -143,14 +154,14 @@ class Aztecanary {
         ]);
 
         this.config = { epochDuration, slotDuration, genesisTime, lag };
-        log("CONFIG", "Chain Params", { 
-            epochDur: epochDuration.toString(), slotDur: slotDuration.toString(), lag: lag.toString() 
+        log("CONFIG", "Chain Params", {
+            epochDur: epochDuration.toString(), slotDur: slotDuration.toString(), lag: lag.toString()
         });
 
         await this.checkValidatorStatus();
-        
+
         const block = await this.provider.getBlock("latest");
-        
+
         // 1. Audit History
         await this.auditCurrentEpochHistory(block);
 
@@ -166,7 +177,7 @@ class Aztecanary {
                 const statusEnum = ["NONE", "VALIDATING", "ZOMBIE", "EXITING"];
                 const status = statusEnum[Number(view.status)] || "UNKNOWN";
                 const balance = ethers.formatEther(view.effectiveBalance);
-                
+
                 if (status !== "VALIDATING") {
                     log("ALERT", `Sequencer ${addr} status: ${status}`, { balance });
                 }
@@ -184,9 +195,9 @@ class Aztecanary {
             ]);
             const data = { committee: committee.map(a => a.toLowerCase()), seed };
             this.epochCache.set(epoch, data);
-            
+
             if (this.epochCache.size > 20) {
-                const keys = Array.from(this.epochCache.keys()).sort((a,b) => (a < b ? -1 : 1));
+                const keys = Array.from(this.epochCache.keys()).sort((a, b) => (a < b ? -1 : 1));
                 this.epochCache.delete(keys[0]);
             }
             return data;
@@ -194,11 +205,17 @@ class Aztecanary {
     }
 
     // --- Core Logic: Check a single block proposal ---
-    async checkBlockPerf(l2BlockNum, txHash, context) {
+    async checkBlockPerf(l2BlockNum, txHash, context, options = {}) {
         if (this.checkedL2Blocks.has(l2BlockNum)) return;
         this.checkedL2Blocks.add(l2BlockNum);
 
         try {
+            const {
+                proposalMissSummary = null,
+                attestationSummary = null,
+                logAttestations = true,
+                logProposalEvents = true
+            } = options;
             const tx = await this.provider.getTransaction(txHash);
             if (!tx) return;
 
@@ -232,7 +249,7 @@ class Aztecanary {
             // --- 1. Proposer Check ---
             const epoch = slot / this.config.epochDuration;
             const epochData = await this.ensureEpochData(epoch);
-            
+
             if (epochData) {
                 const committeeSize = BigInt(epochData.committee.length);
                 const expectedIndex = computeProposerIndex(epoch, slot, epochData.seed, committeeSize);
@@ -241,17 +258,26 @@ class Aztecanary {
 
                 if (TARGET_SEQUENCERS.has(expectedProposer)) {
                     if (expectedProposer === actualProposer) {
-                        log("PROPOSAL_OK", `[${context}] Block ${l2BlockNum} proposed by tracked sequencer ${expectedProposer}`);
+                        if (logProposalEvents) {
+                            log("PROPOSAL_OK", `[${context}] Block ${l2BlockNum} proposed by tracked sequencer ${expectedProposer}`);
+                        }
                     } else {
-                        log("PROPOSAL_MISS", `[${context}] Block ${l2BlockNum} (Slot ${slot}) missed by tracked sequencer ${expectedProposer}. Taken by ${actualProposer}`);
+                        if (logProposalEvents) {
+                            log("PROPOSAL_MISS", `[${context}] Block ${l2BlockNum} (Slot ${slot}) missed by tracked sequencer ${expectedProposer}. Taken by ${actualProposer}`);
+                        }
+                        if (proposalMissSummary) {
+                            const current = proposalMissSummary.get(expectedProposer) || [];
+                            current.push({ slot: slot.toString(), by: actualProposer, l2Block: l2BlockNum.toString(), reason: "taken" });
+                            proposalMissSummary.set(expectedProposer, current);
+                        }
                     }
                 }
             }
 
             // --- 2. Attestation Check (current block committee) ---
             if (epochData) {
-                const targetsInCommittee = epochData.committee.filter(v => TARGET_SEQUENCERS.has(v));
-                // log("ATTEST_DEBUG", `[${context}] Committee info`, { 
+                // const targetsInCommittee = epochData.committee.filter(v => TARGET_SEQUENCERS.has(v));
+                // log("ATTEST_DEBUG", `[${context}] Committee info`, {
                 //     l2Block: l2BlockNum.toString(),
                 //     epoch: epoch.toString(),
                 //     committeeSize: epochData.committee.length,
@@ -264,23 +290,36 @@ class Aztecanary {
                     if (TARGET_SEQUENCERS.has(validator)) {
                         checkedTargets++;
                         const didAttest = checkAttestation(attestations.signatureIndices, index);
-                        if (!didAttest) {
-                            log("ATTEST_MISS", `[${context}] Tracked sequencer ${validator} missed attesting to Block ${l2BlockNum}`);
-                        } else {
+                        if (didAttest) {
                             stats.trackedAttests++;
-                            log("ATTEST_OK", `[${context}] Tracked sequencer ${validator} attested to Block ${l2BlockNum}`);
+                            // if (logAttestations) log("ATTEST_OK", `[${context}] Tracked sequencer ${validator} attested to Block ${l2BlockNum}`);
+                            if (attestationSummary) {
+                                const current = attestationSummary.get(validator) || { missed: 0, ok: 0, slotsMissed: [] };
+                                current.ok += 1;
+                                attestationSummary.set(validator, current);
+                            }
+                        } else {
+                            if (logAttestations) log("ATTEST_MISS", `[${context}] Tracked sequencer ${validator} missed attesting to Block ${l2BlockNum}`);
+                            if (attestationSummary) {
+                                const current = attestationSummary.get(validator) || { missed: 0, ok: 0, slotsMissed: [] };
+                                current.missed += 1;
+                                current.slotsMissed.push(slot.toString());
+                                attestationSummary.set(validator, current);
+                            }
                         }
                     }
                 });
 
-                if (checkedTargets > 0) {
-                    log("DEBUG", `Checked ${checkedTargets} tracked sequencers for attesting in Block ${l2BlockNum}`);
-                }
+                // if (checkedTargets > 0 && logAttestations) {
+                //     log("DEBUG", `Checked ${checkedTargets} tracked sequencers for attesting in Block ${l2BlockNum}`);
+                // }
             } else {
                 log("DEBUG", `[${context}] Missing epoch data for attestation check`, { epoch: epoch.toString(), l2Block: l2BlockNum.toString() });
             }
-            
-            log("PROPOSAL_CHECK", `Analyzed Block ${l2BlockNum}`, { context, slot: slot.toString(), sequencersAttested: stats.trackedAttests });
+
+            // if (context !== "HISTORY") {
+            //     log("PROPOSAL_CHECK", `Analyzed Block ${l2BlockNum}`, { context, slot: slot.toString(), sequencersAttested: stats.trackedAttests });
+            // }
 
         } catch (e) {
             log("ERROR", `Proposal/attestation check failed for L2 Block ${l2BlockNum}`, { error: e.message });
@@ -311,37 +350,50 @@ class Aztecanary {
                 address: ROLLUP_ADDRESS,
                 fromBlock: fromBlock,
                 toBlock: "latest",
-                topics: [ ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])") ]
+                topics: [ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])")]
             };
 
             const logs = await this.provider.getLogs(filter);
             const filledSlots = new Set();
+            const proposalMissSummary = new Map();
+            const attestationSummary = new Map();
 
             // 1. Process logs
-            for(const l of logs) {
+            for (const l of logs) {
                 const parsed = this.rollup.interface.parseLog(l);
-                if(!parsed) continue;
-                
+                if (!parsed) continue;
+
                 const l2BlockNum = parsed.args[0];
                 const blockData = await this.rollup.getBlock(l2BlockNum);
                 const slot = blockData.slotNumber;
-                
+
                 if (slot >= startSlot && slot <= currentSlot) {
                     filledSlots.add(slot.toString());
-                    await this.checkBlockPerf(l2BlockNum, l.transactionHash, "HISTORY");
+                    await this.checkBlockPerf(l2BlockNum, l.transactionHash, "HISTORY", { proposalMissSummary, attestationSummary, logAttestations: false, logProposalEvents: false });
                 }
             }
 
             // 2. Identify Missed Proposals (Empty Slots)
             for (let s = startSlot; s <= currentSlot; s++) {
                 const slotKey = s.toString();
-                if (filledSlots.has(slotKey)) continue; 
+                if (filledSlots.has(slotKey)) continue;
 
                 const pIdx = computeProposerIndex(currentEpoch, s, epochData.seed, BigInt(epochData.committee.length));
                 const expectedProposer = epochData.committee[Number(pIdx)];
-                
+
                 if (TARGET_SEQUENCERS.has(expectedProposer)) {
-                     log("PROPOSAL_MISS", `[HISTORY] Tracked sequencer ${expectedProposer} missed proposal for Slot ${s} (No block produced)`);
+                    const current = proposalMissSummary.get(expectedProposer) || [];
+                    current.push({ slot: s.toString(), by: "none", l2Block: "none", reason: "empty" });
+                    proposalMissSummary.set(expectedProposer, current);
+                }
+            }
+            for (const [sequencer, misses] of proposalMissSummary.entries()) {
+                const slots = misses.map(m => m.slot).join(", ");
+                log("AUDIT_SUMMARY", `Sequencer ${sequencer} missed ${misses.length} proposal(s)`, { category: "proposal", slots, details: misses });
+            }
+            for (const [sequencer, stats] of attestationSummary.entries()) {
+                if (stats.missed > 0) {
+                    log("AUDIT_SUMMARY", `Sequencer ${sequencer} missed ${stats.missed} attestation(s)`, { category: "attestation", slots: stats.slotsMissed.join(", "), details: stats });
                 }
             }
             log("AUDIT", "History check complete");
@@ -355,46 +407,26 @@ class Aztecanary {
         const ts = BigInt(block.timestamp);
         const slot = (ts - this.config.genesisTime) / this.config.slotDuration;
         const epoch = slot / this.config.epochDuration;
+        const dutyInfo = await this.predictDuties(epoch, slot, ts);
 
         if (Number(block.number) % 10 === 0) {
-            const nowTs = BigInt(block.timestamp);
-            let attMsg = "none";
-            if (this.nextDuty && this.nextDuty.currentlyAttesting) {
-                attMsg = "currently attesting";
-            } else if (this.nextDuty && this.nextDuty.attest && this.nextDuty.attest.slot !== null) {
-                const dutySlot = this.nextDuty.attest.slot;
-                const dutyTs = this.config.genesisTime + (dutySlot * this.config.slotDuration);
-                const delta = dutyTs > nowTs ? Number(dutyTs - nowTs) : 0;
-                attMsg = `slot ${dutySlot.toString()} in ${delta}s`;
-            }
+            const attMsg = dutyInfo.currentAttesters.length
+                ? `currently attesting: ${dutyInfo.currentAttesters.map(shortAddr).join(", ")}`
+                : "none";
+            const propMsg = dutyInfo.proposals.length
+                ? dutyInfo.proposals
+                    .sort((a, b) => (a.slot === b.slot ? 0 : a.slot < b.slot ? -1 : 1))
+                    .map(p => `${shortAddr(p.sequencer)}@${p.slot.toString()} in ${formatDuration(p.inSeconds)}`)
+                    .join("; ")
+                : "none";
 
-            let propMsg = "none";
-            if (this.nextDuty && this.nextDuty.propose && this.nextDuty.propose.slot !== null) {
-                const dutySlot = this.nextDuty.propose.slot;
-                const dutyTs = this.config.genesisTime + (dutySlot * this.config.slotDuration);
-                const delta = dutyTs > nowTs ? Number(dutyTs - nowTs) : 0;
-                propMsg = `slot ${dutySlot.toString()} by ${this.nextDuty.propose.sequencer || "unknown"} in ${delta}s`;
-            }
-
-            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch} | Slot: ${slot} | Attest: ${attMsg} | Propose: ${propMsg}`);
+            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch.toString()} | Slot: ${slot.toString()} | Attest: ${attMsg} | Propose: ${propMsg}`);
         }
 
         if (this.currentEpoch && this.currentEpoch !== epoch) {
             this.processedEpochs.delete((epoch + this.config.lag).toString());
         }
         this.currentEpoch = epoch;
-
-        const dutyInfo = await this.predictDuties(epoch, slot);
-        const existing = this.nextDuty || { attest: { slot: null }, propose: { slot: null }, currentlyAttesting: false };
-        const mergeSlot = (prev, cur) => {
-            if (!cur || cur.slot === null) return (prev && prev.slot !== null && prev.slot >= slot) ? prev : { slot: null };
-            return cur;
-        };
-        this.nextDuty = {
-            attest: mergeSlot(existing.attest, dutyInfo.attest),
-            propose: mergeSlot(existing.propose, dutyInfo.propose),
-            currentlyAttesting: dutyInfo.currentlyAttesting
-        };
 
         // If no tracked sequencers in current committee and not forcing history, skip realtime event processing to save RPC.
         if (!processEvents || (dutyInfo && dutyInfo.currentTargets === 0)) return;
@@ -403,7 +435,7 @@ class Aztecanary {
             address: ROLLUP_ADDRESS,
             fromBlock: block.number,
             toBlock: block.number,
-            topics: [ ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])") ]
+            topics: [ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])")]
         });
 
         for (const l of logs) {
@@ -412,64 +444,68 @@ class Aztecanary {
         }
     }
 
-    async predictDuties(currentEpoch, currentSlot) {
+    async predictDuties(currentEpoch, currentSlot, nowTs) {
         const maxEpoch = BigInt(currentEpoch) + this.config.lag;
+        const proposalsBySequencer = new Map();
         let currentTargets = 0;
-        let nextAttest = (this.nextDuty && this.nextDuty.attest && this.nextDuty.attest.slot !== null)
-            ? this.nextDuty.attest
-            : { slot: null, epoch: null };
-        let nextPropose = (this.nextDuty && this.nextDuty.propose && this.nextDuty.propose.slot !== null)
-            ? this.nextDuty.propose
-            : { slot: null, epoch: null, sequencer: null };
-        let currentlyAttesting = false;
+        let currentAttesters = [];
 
         for (let e = BigInt(currentEpoch); e <= maxEpoch; e++) {
             const epochKey = e.toString();
-            if (this.processedEpochs.has(epochKey)) continue;
+            const isCurrent = e === BigInt(currentEpoch);
+            const alreadyProcessed = this.processedEpochs.has(epochKey);
+            if (!isCurrent && alreadyProcessed) continue;
 
             const data = await this.ensureEpochData(e);
             if (!data) continue;
 
-            const isCurrent = e === BigInt(currentEpoch);
-            const tag = isCurrent ? "CURRENT" : "FUTURE";
-
             const inCommittee = data.committee.filter(val => TARGET_SEQUENCERS.has(val));
-            if (inCommittee.length > 0) {
-                log("COMMITTEE", `[${tag}] Epoch ${e}: Tracked sequencers in committee`, { count: inCommittee.length, validators: inCommittee });
-                if (isCurrent) {
-                    currentTargets = inCommittee.length;
-                    currentlyAttesting = true;
+            if (isCurrent) {
+                currentAttesters = inCommittee;
+                currentTargets = inCommittee.length;
+            }
+
+            if (!alreadyProcessed) {
+                const tag = isCurrent ? "CURRENT" : "FUTURE";
+                if (inCommittee.length > 0) {
+                    log("COMMITTEE", `[${tag}] Epoch ${e}: Tracked sequencers in committee`, { count: inCommittee.length, validators: inCommittee });
+                } else {
+                    log("INFO", `[${tag}] Epoch ${e}: No tracked sequencers in committee`);
                 }
-                if (nextAttest.slot === null) {
-                    const slotHint = isCurrent ? currentSlot : (e * this.config.epochDuration);
-                    nextAttest = { slot: slotHint, epoch: e };
-                }
-            } else {
-                if (isCurrent) log("INFO", `[${tag}] Epoch ${e}: No tracked sequencers in committee`);
             }
 
             const startSlot = e * this.config.epochDuration;
-            for (let i = 0n; i < this.config.epochDuration; i++) {
-                const slot = startSlot + i;
-                if (isCurrent && slot < currentSlot) continue; 
+            const endSlot = startSlot + this.config.epochDuration - 1n;
+            const fromSlot = isCurrent ? currentSlot : startSlot;
 
+            for (let slot = fromSlot; slot <= endSlot; slot++) {
                 const proposerIndex = computeProposerIndex(e, slot, data.seed, BigInt(data.committee.length));
                 const proposer = data.committee[Number(proposerIndex)];
 
-                if (TARGET_SEQUENCERS.has(proposer)) {
-                    if ((nextPropose.slot === null || slot < nextPropose.slot) && (!isCurrent || slot >= currentSlot)) {
-                        nextPropose = { slot, epoch: e, sequencer: proposer };
+                if (TARGET_SEQUENCERS.has(proposer) && !proposalsBySequencer.has(proposer)) {
+                    const slotTs = this.config.genesisTime + (slot * this.config.slotDuration);
+                    const delta = slotTs > nowTs ? Number(slotTs - nowTs) : 0;
+                    proposalsBySequencer.set(proposer, { slot, epoch: e, sequencer: proposer, inSeconds: delta });
+
+                    if (!alreadyProcessed) {
+                        const tag = isCurrent ? "CURRENT" : "FUTURE";
+                        log("DUTY", `[${tag}] Proposer duty (tracked sequencer)`, {
+                            epoch: e.toString(),
+                            slot: slot.toString(),
+                            sequencer: proposer,
+                            time: new Date(Number(slotTs) * 1000).toLocaleString()
+                        });
                     }
-                    const ts = this.config.genesisTime + (slot * this.config.slotDuration);
-                    log("DUTY", `[${tag}] Proposer duty (tracked sequencer)`, {
-                        epoch: e.toString(), slot: slot.toString(), sequencer: proposer,
-                        time: new Date(Number(ts) * 1000).toLocaleString()
-                    });
                 }
             }
-            this.processedEpochs.add(epochKey);
+
+            if (!alreadyProcessed) this.processedEpochs.add(epochKey);
         }
-        return { currentTargets, attest: nextAttest, propose: nextPropose, currentlyAttesting };
+
+        const proposals = Array.from(proposalsBySequencer.values());
+        proposals.sort((a, b) => (a.slot === b.slot ? 0 : a.slot < b.slot ? -1 : 1));
+
+        return { currentTargets, currentAttesters, proposals };
     }
 
     async start() {
