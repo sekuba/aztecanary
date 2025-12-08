@@ -299,6 +299,12 @@ class Aztecanary {
             const epochData = await this.ensureEpochData(currentEpoch);
             if (!epochData) return;
 
+            const targetsInCommittee = epochData.committee.filter(val => TARGET_SEQUENCERS.has(val));
+            if (targetsInCommittee.length === 0) {
+                log("INFO", `No tracked targets in epoch ${currentEpoch}; skipping history scan`);
+                return;
+            }
+
             const fromBlock = Math.max(0, currentL1Block.number - HISTORY_LOOKBACK_BLOCKS);
             const filter = {
                 address: ROLLUP_ADDRESS,
@@ -358,9 +364,10 @@ class Aztecanary {
         }
         this.currentEpoch = epoch;
 
-        await this.predictDuties(epoch, slot);
+        const dutyInfo = await this.predictDuties(epoch, slot);
 
-        if (!processEvents) return;
+        // If no tracked targets in current committee and not forcing history, skip realtime event processing to save RPC.
+        if (!processEvents || (dutyInfo && dutyInfo.currentTargets === 0)) return;
 
         const logs = await this.provider.getLogs({
             address: ROLLUP_ADDRESS,
@@ -377,6 +384,7 @@ class Aztecanary {
 
     async predictDuties(currentEpoch, currentSlot) {
         const maxEpoch = BigInt(currentEpoch) + this.config.lag;
+        let currentTargets = 0;
 
         for (let e = BigInt(currentEpoch); e <= maxEpoch; e++) {
             const epochKey = e.toString();
@@ -391,6 +399,7 @@ class Aztecanary {
             const inCommittee = data.committee.filter(val => TARGET_SEQUENCERS.has(val));
             if (inCommittee.length > 0) {
                 log("COMMITTEE", `[${tag}] Epoch ${e}: Targets in committee`, { count: inCommittee.length, validators: inCommittee });
+                if (isCurrent) currentTargets = inCommittee.length;
             } else {
                 if (isCurrent) log("WARN", `[${tag}] Epoch ${e}: No targets in committee`);
             }
@@ -413,6 +422,7 @@ class Aztecanary {
             }
             this.processedEpochs.add(epochKey);
         }
+        return { currentTargets };
     }
 
     async start() {
