@@ -1,11 +1,9 @@
 const { ethers } = require("ethers");
 
-// --- Configuration ---
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8545";
 const HEALTH_CHECK_INTERVAL_BLOCKS = 50;
 const HISTORY_LOOKBACK_BLOCKS = 300;
 
-// Parse targets
 const rawTargets = (process.env.TARGETS || "").split(",");
 const TARGET_SEQUENCERS = new Set(
     rawTargets.map(a => a.trim().toLowerCase()).filter(a => a)
@@ -15,10 +13,9 @@ const ROLLUP_ADDRESS = "0x603bb2c05D474794ea97805e8De69bCcFb3bCA12";
 const ROLLUP_ADDRESS_LC = ROLLUP_ADDRESS.toLowerCase();
 
 const ROLLUP_ABI = [
-    // Events
     "event L2BlockProposed(uint256 indexed blockNumber, bytes32 indexed archive, bytes32[] versionedBlobHashes)",
-    // Views
     "function getAttesterView(address _attester) view returns (tuple(uint8 status, uint256 effectiveBalance, tuple(uint256 withdrawalId, uint256 amount, uint256 exitableAt, address recipientOrWithdrawer, bool isRecipient, bool exists) exit, tuple(tuple(uint256 x, uint256 y) publicKey, address withdrawer) config))",
+    "function getCurrentProposer() view returns (address)",
     "function getCurrentEpoch() view returns (uint256)",
     "function getEpochCommittee(uint256 _epoch) view returns (address[])",
     "function getSampleSeedAt(uint256 _ts) view returns (uint256)",
@@ -27,17 +24,13 @@ const ROLLUP_ABI = [
     "function getSlotDuration() view returns (uint256)",
     "function getGenesisTime() view returns (uint256)",
     "function getBlock(uint256 _blockNumber) view returns (tuple(bytes32 archive, bytes32 headerHash, bytes32 blobCommitmentsHash, bytes32 attestationsHash, bytes32 payloadDigest, uint256 slotNumber, tuple(uint256 excessMana, uint256 manaUsed, uint256 feeAssetPriceNumerator, uint256 congestionCost, uint256 proverCost) feeHeader))",
-    // Decode helpers
     "function propose(tuple(bytes32 archive, tuple(tuple(bytes32 root, uint32 nextAvailableLeafIndex) l1ToL2MessageTree, tuple(tuple(bytes32 root, uint32 nextAvailableLeafIndex) noteHashTree, tuple(bytes32 root, uint32 nextAvailableLeafIndex) nullifierTree, tuple(bytes32 root, uint32 nextAvailableLeafIndex) publicDataTree) partialStateReference) stateReference, tuple(int256 feeAssetPriceModifier) oracleInput, tuple(bytes32 lastArchiveRoot, tuple(bytes32 blobsHash, bytes32 inHash, bytes32 outHash) contentCommitment, uint256 slotNumber, uint256 timestamp, address coinbase, bytes32 feeRecipient, tuple(uint128 feePerDaGas, uint128 feePerL2Gas) gasFees, uint256 totalManaUsed) header) _args, tuple(bytes signatureIndices, bytes signaturesOrAddresses) _attestations, address[] _signers, tuple(uint8 v, bytes32 r, bytes32 s) _attestationsAndSignersSignature, bytes _blobInput)"
 ];
 
-// Multicall (propose is sometimes wrapped)
 const MULTICALL_ABI = [
     "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) payable returns (tuple(bool success, bytes returnData)[] returnData)",
     "function aggregate3Value(tuple(address target, bool allowFailure, uint256 value, bytes callData)[] calls) payable returns (tuple(bool success, bytes returnData)[] returnData)"
 ];
-
-// --- Helpers ---
 
 function log(type, message, data = {}) {
     console.log(JSON.stringify({ timestamp: new Date().toISOString(), type, message, ...data }));
@@ -65,7 +58,6 @@ function computeProposerIndex(epoch, slot, seed, committeeSize) {
 }
 
 function decodeProposeFromTx(tx, rollupIface, multicallIface) {
-    // 1) Direct call to rollup.propose
     try {
         const decoded = rollupIface.parseTransaction({ data: tx.data, value: tx.value });
         if (decoded && decoded.name === "propose") {
@@ -73,13 +65,11 @@ function decodeProposeFromTx(tx, rollupIface, multicallIface) {
         }
     } catch (_) { }
 
-    // 2) Multicall wrappers (aggregate3 / aggregate3Value)
     try {
         const multi = multicallIface.parseTransaction({ data: tx.data, value: tx.value });
         if (!multi || (multi.name !== "aggregate3" && multi.name !== "aggregate3Value")) return null;
 
         for (const call of multi.args[0]) {
-            // tuple layout differs slightly between aggregate3 and aggregate3Value
             const target = (call.target || call[0] || "").toLowerCase();
             if (target !== ROLLUP_ADDRESS_LC) continue;
 
@@ -105,13 +95,8 @@ function checkAttestation(signatureIndicesBytes, index) {
 
     if (byteIndex >= bytesBuffer.length) return false;
 
-    // Check if bit is set (bit 0 is MSB or LSB? Solidity bitmap usually: index 0 is 7th bit of byte 0)
-    // Solidity: (uint8(bytes[byteIndex]) >> shift) & 1
-    // shift = 7 - (index % 8)
     return ((bytesBuffer[byteIndex] >> shift) & 1) === 1;
 }
-
-// --- Main Class ---
 
 class Aztecanary {
     constructor() {
@@ -192,7 +177,27 @@ class Aztecanary {
         } catch (e) { return null; }
     }
 
-    // --- Core Logic: Check a single block proposal ---
+    async resolveActualProposer(tx, decoded, txHash) {
+        const args = decoded?.args || [];
+        const rawSigners = args._signers || args[2] || [];
+        const signers = Array.from(rawSigners || []).map(s => (typeof s === "string" ? s : s.toString()).toLowerCase());
+
+        let proposer = null;
+        if (tx && tx.blockNumber !== null && tx.blockNumber !== undefined) {
+            try {
+                const onChain = await this.rollup.getCurrentProposer({ blockTag: tx.blockNumber });
+                if (onChain) proposer = onChain.toLowerCase();
+            } catch (e) {
+                log("DEBUG", `Failed to read current proposer for tx ${txHash}`, { block: tx.blockNumber, error: e.message });
+            }
+        }
+
+        if (!proposer && signers.length > 0) proposer = signers[0];
+        if (!proposer && tx && tx.from) proposer = tx.from.toLowerCase();
+
+        return proposer;
+    }
+
     async checkBlockPerf(l2BlockNum, txHash, context, options = {}) {
         if (this.checkedL2Blocks.has(l2BlockNum)) return;
         this.checkedL2Blocks.add(l2BlockNum);
@@ -228,21 +233,18 @@ class Aztecanary {
             }
 
             const slot = BigInt(header.slotNumber.toString());
-            const actualProposer = tx.from.toLowerCase();
-            const sigBytes = ethers.getBytes(attestations.signatureIndices);
+            // const sigBytes = ethers.getBytes(attestations.signatureIndices);
 
-            // Stats for this block
-            let stats = { proposer: "N/A", attests: 0, trackedAttests: 0 };
-
-            // --- 1. Proposer Check ---
             const epoch = slot / this.config.epochDuration;
             const epochData = await this.ensureEpochData(epoch);
+            const actualProposer = (await this.resolveActualProposer(tx, decoded, txHash)) || "unknown";
+            const stats = { trackedAttests: 0, expectedProposer: null, actualProposer };
 
             if (epochData) {
                 const committeeSize = BigInt(epochData.committee.length);
                 const expectedIndex = computeProposerIndex(epoch, slot, epochData.seed, committeeSize);
                 const expectedProposer = epochData.committee[Number(expectedIndex)];
-                stats.proposer = expectedProposer;
+                stats.expectedProposer = expectedProposer;
 
                 if (TARGET_SEQUENCERS.has(expectedProposer)) {
                     if (expectedProposer === actualProposer) {
@@ -262,7 +264,6 @@ class Aztecanary {
                 }
             }
 
-            // --- 2. Attestation Check (current block committee) ---
             if (epochData) {
                 // const targetsInCommittee = epochData.committee.filter(v => TARGET_SEQUENCERS.has(v));
                 // log("ATTEST_DEBUG", `[${context}] Committee info`, {
@@ -314,7 +315,6 @@ class Aztecanary {
         }
     }
 
-    // --- Historical Analysis ---
     async auditCurrentEpochHistory(currentL1Block) {
         try {
             const ts = BigInt(currentL1Block.timestamp);
@@ -361,7 +361,6 @@ class Aztecanary {
                 }
             }
 
-            // 2. Identify Missed Proposals (Empty Slots)
             for (let s = startSlot; s <= currentSlot; s++) {
                 const slotKey = s.toString();
                 if (filledSlots.has(slotKey)) continue;
