@@ -124,6 +124,7 @@ class Aztecanary {
         this.processedEpochs = new Set();
         this.epochCache = new Map(); 
         this.checkedL2Blocks = new Set();
+        this.nextDuty = { slot: null };
     }
 
     async init() {
@@ -356,7 +357,15 @@ class Aztecanary {
         const epoch = slot / this.config.epochDuration;
 
         if (Number(block.number) % 10 === 0) {
-            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch} | Slot: ${slot}`);
+            let nextDutyMsg = "none";
+            if (this.nextDuty && this.nextDuty.slot !== null) {
+                const dutySlot = this.nextDuty.slot;
+                const dutyTs = this.config.genesisTime + (dutySlot * this.config.slotDuration);
+                const nowTs = BigInt(block.timestamp);
+                const delta = dutyTs > nowTs ? Number(dutyTs - nowTs) : 0;
+                nextDutyMsg = `slot ${dutySlot.toString()} in ${delta}s`;
+            }
+            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch} | Slot: ${slot} | NextDuty: ${nextDutyMsg}`);
         }
 
         if (this.currentEpoch && this.currentEpoch !== epoch) {
@@ -365,6 +374,7 @@ class Aztecanary {
         this.currentEpoch = epoch;
 
         const dutyInfo = await this.predictDuties(epoch, slot);
+        this.nextDuty = dutyInfo.nextDuty || { slot: null };
 
         // If no tracked targets in current committee and not forcing history, skip realtime event processing to save RPC.
         if (!processEvents || (dutyInfo && dutyInfo.currentTargets === 0)) return;
@@ -385,6 +395,7 @@ class Aztecanary {
     async predictDuties(currentEpoch, currentSlot) {
         const maxEpoch = BigInt(currentEpoch) + this.config.lag;
         let currentTargets = 0;
+        let nextDuty = { slot: null, epoch: null };
 
         for (let e = BigInt(currentEpoch); e <= maxEpoch; e++) {
             const epochKey = e.toString();
@@ -413,6 +424,9 @@ class Aztecanary {
                 const proposer = data.committee[Number(proposerIndex)];
 
                 if (TARGET_SEQUENCERS.has(proposer)) {
+                    if (nextDuty.slot === null && (!isCurrent || slot >= currentSlot)) {
+                        nextDuty = { slot, epoch: e };
+                    }
                     const ts = this.config.genesisTime + (slot * this.config.slotDuration);
                     log("DUTY", `[${tag}] Proposer Duty`, {
                         epoch: e.toString(), slot: slot.toString(), validator: proposer,
@@ -422,7 +436,7 @@ class Aztecanary {
             }
             this.processedEpochs.add(epochKey);
         }
-        return { currentTargets };
+        return { currentTargets, nextDuty };
     }
 
     async start() {
