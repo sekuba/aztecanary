@@ -131,7 +131,7 @@ class Aztecanary {
         log("INFO", "Initializing...");
         
         // Log tracked addresses to confirm config
-        log("CONFIG", `Tracking ${TARGET_SEQUENCERS.size} validators`, { 
+        log("CONFIG", `Tracking ${TARGET_SEQUENCERS.size} sequencers`, { 
             targets: Array.from(TARGET_SEQUENCERS).map(a => `${a.slice(0,6)}...${a.slice(-4)}`) 
         });
 
@@ -168,7 +168,7 @@ class Aztecanary {
                 const balance = ethers.formatEther(view.effectiveBalance);
                 
                 if (status !== "VALIDATING") {
-                    log("ALERT", `Validator ${addr} status: ${status}`, { balance });
+                    log("ALERT", `Sequencer ${addr} status: ${status}`, { balance });
                 }
             } catch (e) { log("ERROR", `Status check failed for ${addr}`); }
         }
@@ -227,7 +227,7 @@ class Aztecanary {
             const sigBytes = ethers.getBytes(attestations.signatureIndices);
 
             // Stats for this block
-            let stats = { proposer: "N/A", attests: 0, targetAttests: 0 };
+            let stats = { proposer: "N/A", attests: 0, trackedAttests: 0 };
 
             // --- 1. Proposer Check ---
             const epoch = slot / this.config.epochDuration;
@@ -241,9 +241,9 @@ class Aztecanary {
 
                 if (TARGET_SEQUENCERS.has(expectedProposer)) {
                     if (expectedProposer === actualProposer) {
-                        log("PERF_SUCCESS", `[${context}] Block ${l2BlockNum} proposed by target ${expectedProposer}`);
+                        log("PROPOSAL_OK", `[${context}] Block ${l2BlockNum} proposed by tracked sequencer ${expectedProposer}`);
                     } else {
-                        log("PERF_MISS", `[${context}] Block ${l2BlockNum} (Slot ${slot}) MISSED. Taken by ${actualProposer}`);
+                        log("PROPOSAL_MISS", `[${context}] Block ${l2BlockNum} (Slot ${slot}) missed by tracked sequencer ${expectedProposer}. Taken by ${actualProposer}`);
                     }
                 }
             }
@@ -265,25 +265,25 @@ class Aztecanary {
                         checkedTargets++;
                         const didAttest = checkAttestation(attestations.signatureIndices, index);
                         if (!didAttest) {
-                            log("ATTEST_MISS", `[${context}] Target ${validator} missed attestation for Block ${l2BlockNum}`);
+                            log("ATTEST_MISS", `[${context}] Tracked sequencer ${validator} missed attesting to Block ${l2BlockNum}`);
                         } else {
-                            stats.targetAttests++;
-                            log("ATTEST_OK", `[${context}] Target ${validator} attested to Block ${l2BlockNum}`);
+                            stats.trackedAttests++;
+                            log("ATTEST_OK", `[${context}] Tracked sequencer ${validator} attested to Block ${l2BlockNum}`);
                         }
                     }
                 });
-                
+
                 if (checkedTargets > 0) {
-                //    log("DEBUG", `Checked ${checkedTargets} targets for attestations in Block ${l2BlockNum}`);
+                    log("DEBUG", `Checked ${checkedTargets} tracked sequencers for attesting in Block ${l2BlockNum}`);
                 }
             } else {
                 log("DEBUG", `[${context}] Missing epoch data for attestation check`, { epoch: epoch.toString(), l2Block: l2BlockNum.toString() });
             }
             
-            log("PERF_CHECK", `Analyzed Block ${l2BlockNum}`, { context, slot: slot.toString(), targetsAttested: stats.targetAttests });
+            log("PROPOSAL_CHECK", `Analyzed Block ${l2BlockNum}`, { context, slot: slot.toString(), sequencersAttested: stats.trackedAttests });
 
         } catch (e) {
-            log("ERROR", `Perf check failed for L2 Block ${l2BlockNum}`, { error: e.message });
+            log("ERROR", `Proposal/attestation check failed for L2 Block ${l2BlockNum}`, { error: e.message });
         }
     }
 
@@ -302,7 +302,7 @@ class Aztecanary {
 
             const targetsInCommittee = epochData.committee.filter(val => TARGET_SEQUENCERS.has(val));
             if (targetsInCommittee.length === 0) {
-                log("INFO", `No tracked targets in epoch ${currentEpoch}; skipping history scan`);
+                log("INFO", `No tracked sequencers in epoch ${currentEpoch}; skipping history scan`);
                 return;
             }
 
@@ -341,7 +341,7 @@ class Aztecanary {
                 const expectedProposer = epochData.committee[Number(pIdx)];
                 
                 if (TARGET_SEQUENCERS.has(expectedProposer)) {
-                     log("PERF_MISS", `[HISTORY] Target ${expectedProposer} MISSED proposal for Slot ${s} (No block produced)`);
+                     log("PROPOSAL_MISS", `[HISTORY] Tracked sequencer ${expectedProposer} missed proposal for Slot ${s} (No block produced)`);
                 }
             }
             log("AUDIT", "History check complete");
@@ -376,7 +376,7 @@ class Aztecanary {
         const dutyInfo = await this.predictDuties(epoch, slot);
         this.nextDuty = dutyInfo.nextDuty || { slot: null };
 
-        // If no tracked targets in current committee and not forcing history, skip realtime event processing to save RPC.
+        // If no tracked sequencers in current committee and not forcing history, skip realtime event processing to save RPC.
         if (!processEvents || (dutyInfo && dutyInfo.currentTargets === 0)) return;
 
         const logs = await this.provider.getLogs({
@@ -409,14 +409,14 @@ class Aztecanary {
 
             const inCommittee = data.committee.filter(val => TARGET_SEQUENCERS.has(val));
             if (inCommittee.length > 0) {
-                log("COMMITTEE", `[${tag}] Epoch ${e}: Targets in committee`, { count: inCommittee.length, validators: inCommittee });
+                log("COMMITTEE", `[${tag}] Epoch ${e}: Tracked sequencers in committee`, { count: inCommittee.length, validators: inCommittee });
                 if (isCurrent) currentTargets = inCommittee.length;
                 if (nextDuty.slot === null) {
                     const slotHint = isCurrent ? currentSlot : (e * this.config.epochDuration);
                     nextDuty = { slot: slotHint, epoch: e };
                 }
             } else {
-                if (isCurrent) log("WARN", `[${tag}] Epoch ${e}: No targets in committee`);
+                if (isCurrent) log("WARN", `[${tag}] Epoch ${e}: No tracked sequencers in committee`);
             }
 
             const startSlot = e * this.config.epochDuration;
@@ -432,8 +432,8 @@ class Aztecanary {
                         nextDuty = { slot, epoch: e };
                     }
                     const ts = this.config.genesisTime + (slot * this.config.slotDuration);
-                    log("DUTY", `[${tag}] Proposer Duty`, {
-                        epoch: e.toString(), slot: slot.toString(), validator: proposer,
+                    log("DUTY", `[${tag}] Proposer duty (tracked sequencer)`, {
+                        epoch: e.toString(), slot: slot.toString(), sequencer: proposer,
                         time: new Date(Number(ts) * 1000).toLocaleString()
                     });
                 }
@@ -450,7 +450,7 @@ class Aztecanary {
             const block = await this.provider.getBlock(bn);
             await this.handleBlock(block, true);
         });
-        log("INFO", `Monitoring active for ${TARGET_SEQUENCERS.size} targets`);
+        log("INFO", `Monitoring active for ${TARGET_SEQUENCERS.size} tracked sequencers`);
     }
 }
 
