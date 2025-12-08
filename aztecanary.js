@@ -261,7 +261,9 @@ class Aztecanary {
 
             const header = callArgs.header;
             const attestations = args._attestations || args[1];
-            if (!attestations || !attestations.signatureIndices) {
+            const signers = Array.from(args._signers || args[2] || []).map(s => (typeof s === "string" ? s : s.toString()).toLowerCase());
+            const hasSignatureBits = !!(attestations && attestations.signatureIndices);
+            if (!hasSignatureBits && signers.length === 0) {
                 log("ERROR", `[${context}] Missing attestation payload in propose tx`, { tx: txHash });
                 return;
             }
@@ -275,14 +277,16 @@ class Aztecanary {
             const stats = { trackedAttests: 0, expectedProposer: null, actualProposer };
             this.proposedSlots.add(slot.toString());
 
+            let proposerMismatch = false;
             if (epochData) {
                 const committeeSize = BigInt(epochData.committee.length);
                 const expectedIndex = computeProposerIndex(epoch, slot, epochData.seed, committeeSize);
                 const expectedProposer = epochData.committee[Number(expectedIndex)];
                 stats.expectedProposer = expectedProposer;
+                proposerMismatch = expectedProposer !== actualProposer;
 
                 if (TARGET_SEQUENCERS.has(expectedProposer)) {
-                    if (expectedProposer === actualProposer) {
+                    if (!proposerMismatch) {
                         if (logProposalEvents) {
                             log("PROPOSAL_OK", `[${context}] Block ${l2BlockNum} proposed by tracked sequencer ${expectedProposer}`);
                         }
@@ -299,6 +303,9 @@ class Aztecanary {
                 }
             }
 
+            // If we cannot trust proposer decoding, skip attestation accounting to avoid false misses.
+            if (proposerMismatch) return;
+
             if (epochData) {
                 // const targetsInCommittee = epochData.committee.filter(v => TARGET_SEQUENCERS.has(v));
                 // log("ATTEST_DEBUG", `[${context}] Committee info`, {
@@ -313,7 +320,10 @@ class Aztecanary {
                 epochData.committee.forEach((validator, index) => {
                     if (TARGET_SEQUENCERS.has(validator)) {
                         checkedTargets++;
-                        const didAttest = checkAttestation(attestations.signatureIndices, index);
+                        let didAttest = signers.includes(validator);
+                        if (!didAttest && hasSignatureBits) {
+                            didAttest = checkAttestation(attestations.signatureIndices, index);
+                        }
                         if (didAttest) {
                             stats.trackedAttests++;
                             // if (logAttestations) log("ATTEST_OK", `[${context}] Tracked sequencer ${validator} attested to Block ${l2BlockNum}`);
