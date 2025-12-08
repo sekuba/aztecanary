@@ -109,6 +109,8 @@ class Aztecanary {
         this.processedEpochs = new Set();
         this.epochCache = new Map();
         this.checkedL2Blocks = new Set();
+        this.proposedSlots = new Set();
+        this.lastCheckedSlot = null;
     }
 
     async init() {
@@ -198,6 +200,38 @@ class Aztecanary {
         return proposer;
     }
 
+    async markMissedSlotsUntil(currentSlot, context = "REALTIME") {
+        if (this.lastCheckedSlot === null) {
+            this.lastCheckedSlot = currentSlot;
+            return;
+        }
+
+        const start = this.lastCheckedSlot;
+        const end = currentSlot - 1n; // only evaluate slots that have fully elapsed
+        if (start > end) {
+            this.lastCheckedSlot = currentSlot;
+            return;
+        }
+
+        for (let slot = start; slot <= end; slot++) {
+            const slotKey = slot.toString();
+            if (this.proposedSlots.has(slotKey)) continue;
+
+            const epoch = slot / this.config.epochDuration;
+            const epochData = await this.ensureEpochData(epoch);
+            if (!epochData || epochData.committee.length === 0) continue;
+
+            const proposerIdx = computeProposerIndex(epoch, slot, epochData.seed, BigInt(epochData.committee.length));
+            const expectedProposer = epochData.committee[Number(proposerIdx)];
+
+            if (TARGET_SEQUENCERS.has(expectedProposer)) {
+                log("PROPOSAL_MISS", `[${context}] Slot ${slot} missed by tracked sequencer ${expectedProposer} (no proposal observed)`);
+            }
+        }
+
+        this.lastCheckedSlot = currentSlot;
+    }
+
     async checkBlockPerf(l2BlockNum, txHash, context, options = {}) {
         if (this.checkedL2Blocks.has(l2BlockNum)) return;
         this.checkedL2Blocks.add(l2BlockNum);
@@ -239,6 +273,7 @@ class Aztecanary {
             const epochData = await this.ensureEpochData(epoch);
             const actualProposer = (await this.resolveActualProposer(tx, decoded, txHash)) || "unknown";
             const stats = { trackedAttests: 0, expectedProposer: null, actualProposer };
+            this.proposedSlots.add(slot.toString());
 
             if (epochData) {
                 const committeeSize = BigInt(epochData.committee.length);
@@ -253,11 +288,11 @@ class Aztecanary {
                         }
                     } else {
                         if (logProposalEvents) {
-                            log("PROPOSAL_MISS", `[${context}] Block ${l2BlockNum} (Slot ${slot}) missed by tracked sequencer ${expectedProposer}. Taken by ${actualProposer}`);
+                            log("PROPOSER_MISMATCH", `[${context}] Expected proposer ${expectedProposer} but resolved proposer ${actualProposer} for Block ${l2BlockNum} (Slot ${slot}). Indicates decode/lookup mismatch.`);
                         }
                         if (proposalMissSummary) {
                             const current = proposalMissSummary.get(expectedProposer) || [];
-                            current.push({ slot: slot.toString(), by: actualProposer, l2Block: l2BlockNum.toString(), reason: "taken" });
+                            current.push({ slot: slot.toString(), by: actualProposer, l2Block: l2BlockNum.toString(), reason: "mismatch" });
                             proposalMissSummary.set(expectedProposer, current);
                         }
                     }
@@ -415,8 +450,11 @@ class Aztecanary {
         }
         this.currentEpoch = epoch;
 
-        // If no tracked sequencers in current committee and not forcing history, skip realtime event processing to save RPC.
-        if (!processEvents || (dutyInfo && dutyInfo.currentTargets === 0)) return;
+        const shouldProcessEvents = processEvents && (!dutyInfo || dutyInfo.currentTargets > 0);
+        if (!shouldProcessEvents) {
+            await this.markMissedSlotsUntil(slot, "REALTIME");
+            return;
+        }
 
         const logs = await this.provider.getLogs({
             address: ROLLUP_ADDRESS,
@@ -429,6 +467,8 @@ class Aztecanary {
             const parsed = this.rollup.interface.parseLog(l);
             await this.checkBlockPerf(parsed.args[0], l.transactionHash, "REALTIME");
         }
+
+        await this.markMissedSlotsUntil(slot, "REALTIME");
     }
 
     async predictDuties(currentEpoch, currentSlot, nowTs) {
