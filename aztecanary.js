@@ -1,12 +1,13 @@
 /**
- * aztecanary.js
+ * aztecanary.js v6
  * 
- * A minimal, efficient monitor for Aztec Sequencers.
- * Features:
- * - Real-time Proposal/Attestation monitoring
- * - Predictive Scheduling (Current Epoch + Lag Lookahead)
- * - Historical verification of the current epoch (detects recent misses on startup)
- * - Validator Health Checks
+ * Monitor for Aztec Sequencers.
+ * 
+ * Changelog:
+ * - Added explicit tracking logs on startup.
+ * - Added "PERF_CHECK" summary logs for visibility.
+ * - Enabled verbose Attestation logs (OK/MISS).
+ * - Refined committee matching logic.
  */
 
 const { ethers } = require("ethers");
@@ -14,10 +15,12 @@ const { ethers } = require("ethers");
 // --- Configuration ---
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8545";
 const HEALTH_CHECK_INTERVAL_BLOCKS = 50; 
+const HISTORY_LOOKBACK_BLOCKS = 300; 
 
-// Addresses to watch
+// Parse targets
+const rawTargets = (process.env.TARGETS || "").split(",");
 const TARGET_SEQUENCERS = new Set(
-    (process.env.TARGETS || "").split(",").map(a => a.trim().toLowerCase()).filter(a => a)
+    rawTargets.map(a => a.trim().toLowerCase()).filter(a => a)
 );
 
 const ROLLUP_ADDRESS = "0x603bb2c05D474794ea97805e8De69bCcFb3bCA12";
@@ -58,7 +61,12 @@ function checkAttestation(signatureIndicesBytes, index) {
     const byteIndex = Math.floor(index / 8);
     const shift = 7 - (index % 8);
     const bytesBuffer = ethers.getBytes(signatureIndicesBytes);
+    
     if (byteIndex >= bytesBuffer.length) return false;
+    
+    // Check if bit is set (bit 0 is MSB or LSB? Solidity bitmap usually: index 0 is 7th bit of byte 0)
+    // Solidity: (uint8(bytes[byteIndex]) >> shift) & 1
+    // shift = 7 - (index % 8)
     return ((bytesBuffer[byteIndex] >> shift) & 1) === 1;
 }
 
@@ -72,11 +80,18 @@ class Aztecanary {
         
         this.config = {};
         this.processedEpochs = new Set();
-        this.epochCache = new Map(); // Epoch -> { committee, seed }
+        this.epochCache = new Map(); 
+        this.checkedL2Blocks = new Set();
     }
 
     async init() {
-        log("INFO", "Initializing Aztecanary...");
+        log("INFO", "Initializing...");
+        
+        // Log tracked addresses to confirm config
+        log("CONFIG", `Tracking ${TARGET_SEQUENCERS.size} validators`, { 
+            targets: Array.from(TARGET_SEQUENCERS).map(a => `${a.slice(0,6)}...${a.slice(-4)}`) 
+        });
+
         const [epochDuration, slotDuration, genesisTime, lag] = await Promise.all([
             this.rollup.getEpochDuration(),
             this.rollup.getSlotDuration(),
@@ -85,17 +100,19 @@ class Aztecanary {
         ]);
 
         this.config = { epochDuration, slotDuration, genesisTime, lag };
-        log("CONFIG", "Params Loaded", { 
-            epochDuration: epochDuration.toString(), slotDuration: slotDuration.toString(), lag: lag.toString() 
+        log("CONFIG", "Chain Params", { 
+            epochDur: epochDuration.toString(), slotDur: slotDuration.toString(), lag: lag.toString() 
         });
 
-        // Startup checks
         await this.checkValidatorStatus();
-        const block = await this.provider.getBlock("latest");
-        await this.handleBlock(block); // This triggers current state prediction
         
-        // Run historical verification for the current active epoch to catch misses that happened before we started
-        await this.verifyCurrentEpochHistory(block);
+        const block = await this.provider.getBlock("latest");
+        
+        // 1. Audit History
+        await this.auditCurrentEpochHistory(block);
+
+        // 2. Realtime (catch up)
+        await this.handleBlock(block, false);
     }
 
     async checkValidatorStatus() {
@@ -106,6 +123,7 @@ class Aztecanary {
                 const statusEnum = ["NONE", "VALIDATING", "ZOMBIE", "EXITING"];
                 const status = statusEnum[Number(view.status)] || "UNKNOWN";
                 const balance = ethers.formatEther(view.effectiveBalance);
+                
                 if (status !== "VALIDATING") {
                     log("ALERT", `Validator ${addr} status: ${status}`, { balance });
                 }
@@ -123,8 +141,173 @@ class Aztecanary {
             ]);
             const data = { committee: committee.map(a => a.toLowerCase()), seed };
             this.epochCache.set(epoch, data);
+            
+            if (this.epochCache.size > 20) {
+                const keys = Array.from(this.epochCache.keys()).sort((a,b) => (a < b ? -1 : 1));
+                this.epochCache.delete(keys[0]);
+            }
             return data;
         } catch (e) { return null; }
+    }
+
+    // --- Core Logic: Check a single block proposal ---
+    async checkBlockPerf(l2BlockNum, txHash, context) {
+        if (this.checkedL2Blocks.has(l2BlockNum)) return;
+        this.checkedL2Blocks.add(l2BlockNum);
+
+        try {
+            const tx = await this.provider.getTransaction(txHash);
+            if (!tx) return;
+            const decoded = this.iface.parseTransaction({ data: tx.data, value: tx.value });
+            if (!decoded || decoded.name !== 'propose') return;
+
+            const header = decoded.args._args.header;
+            const attestations = decoded.args._attestations;
+            const slot = header.slotNumber;
+            const actualProposer = tx.from.toLowerCase();
+
+            // Stats for this block
+            let stats = { proposer: "N/A", attests: 0, targetAttests: 0 };
+
+            // --- 1. Proposer Check ---
+            const epoch = slot / this.config.epochDuration;
+            const epochData = await this.ensureEpochData(epoch);
+            
+            if (epochData) {
+                const committeeSize = BigInt(epochData.committee.length);
+                const expectedIndex = computeProposerIndex(epoch, slot, epochData.seed, committeeSize);
+                const expectedProposer = epochData.committee[Number(expectedIndex)];
+                stats.proposer = expectedProposer;
+
+                if (TARGET_SEQUENCERS.has(expectedProposer)) {
+                    if (expectedProposer === actualProposer) {
+                        log("PERF_SUCCESS", `[${context}] Block ${l2BlockNum} proposed by target ${expectedProposer}`);
+                    } else {
+                        log("PERF_MISS", `[${context}] Block ${l2BlockNum} (Slot ${slot}) MISSED. Taken by ${actualProposer}`);
+                    }
+                }
+            }
+
+            // --- 2. Attestation Check ---
+            const parentSlot = slot - 1n;
+            const parentEpoch = parentSlot / this.config.epochDuration;
+            const parentData = (parentEpoch === epoch) ? epochData : await this.ensureEpochData(parentEpoch);
+
+            if (parentData) {
+                let targetsInCommittee = 0;
+                parentData.committee.forEach((validator, index) => {
+                    if (TARGET_SEQUENCERS.has(validator)) {
+                        targetsInCommittee++;
+                        const didAttest = checkAttestation(attestations.signatureIndices, index);
+                        if (!didAttest) {
+                            log("ATTEST_MISS", `[${context}] Target ${validator} missed attestation for parent of Block ${l2BlockNum}`);
+                        } else {
+                            stats.targetAttests++;
+                            log("ATTEST_OK", `[${context}] Target ${validator} attested to parent of Block ${l2BlockNum}`);
+                        }
+                    }
+                });
+                
+                // If we found targets in the committee but they weren't checked above, logic error
+                if (targetsInCommittee > 0) {
+                   log("DEBUG", `Checked ${targetsInCommittee} targets for attestations in Block ${l2BlockNum}`);
+                }
+            }
+            
+            log("PERF_CHECK", `Analyzed Block ${l2BlockNum}`, { context, slot: slot.toString(), targetsAttested: stats.targetAttests });
+
+        } catch (e) {
+            log("ERROR", `Perf check failed for L2 Block ${l2BlockNum}`, { error: e.message });
+        }
+    }
+
+    // --- Historical Analysis ---
+    async auditCurrentEpochHistory(currentL1Block) {
+        try {
+            const ts = BigInt(currentL1Block.timestamp);
+            const currentSlot = (ts - this.config.genesisTime) / this.config.slotDuration;
+            const currentEpoch = currentSlot / this.config.epochDuration;
+            const startSlot = currentEpoch * this.config.epochDuration;
+
+            log("AUDIT", `Scanning Epoch ${currentEpoch} (Slots ${startSlot} to ${currentSlot})`);
+
+            const epochData = await this.ensureEpochData(currentEpoch);
+            if (!epochData) return;
+
+            const fromBlock = Math.max(0, currentL1Block.number - HISTORY_LOOKBACK_BLOCKS);
+            const filter = {
+                address: ROLLUP_ADDRESS,
+                fromBlock: fromBlock,
+                toBlock: "latest",
+                topics: [ ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])") ]
+            };
+
+            const logs = await this.provider.getLogs(filter);
+            const filledSlots = new Set();
+
+            // 1. Process logs
+            for(const l of logs) {
+                const parsed = this.rollup.interface.parseLog(l);
+                if(!parsed) continue;
+                
+                const l2BlockNum = parsed.args[0];
+                const blockData = await this.rollup.getBlock(l2BlockNum);
+                const slot = blockData.slotNumber;
+                
+                if (slot >= startSlot && slot <= currentSlot) {
+                    filledSlots.add(slot.toString());
+                    await this.checkBlockPerf(l2BlockNum, l.transactionHash, "HISTORY");
+                }
+            }
+
+            // 2. Identify Missed Proposals (Empty Slots)
+            for (let s = startSlot; s <= currentSlot; s++) {
+                const slotKey = s.toString();
+                if (filledSlots.has(slotKey)) continue; 
+
+                const pIdx = computeProposerIndex(currentEpoch, s, epochData.seed, BigInt(epochData.committee.length));
+                const expectedProposer = epochData.committee[Number(pIdx)];
+                
+                if (TARGET_SEQUENCERS.has(expectedProposer)) {
+                     log("PERF_MISS", `[HISTORY] Target ${expectedProposer} MISSED proposal for Slot ${s} (No block produced)`);
+                }
+            }
+            log("AUDIT", "History check complete");
+
+        } catch (e) {
+            log("ERROR", "History verification failed", { error: e.message });
+        }
+    }
+
+    async handleBlock(block, processEvents = true) {
+        const ts = BigInt(block.timestamp);
+        const slot = (ts - this.config.genesisTime) / this.config.slotDuration;
+        const epoch = slot / this.config.epochDuration;
+
+        if (Number(block.number) % 10 === 0) {
+            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch} | Slot: ${slot}`);
+        }
+
+        if (this.currentEpoch && this.currentEpoch !== epoch) {
+            this.processedEpochs.delete((epoch + this.config.lag).toString());
+        }
+        this.currentEpoch = epoch;
+
+        await this.predictDuties(epoch, slot);
+
+        if (!processEvents) return;
+
+        const logs = await this.provider.getLogs({
+            address: ROLLUP_ADDRESS,
+            fromBlock: block.number,
+            toBlock: block.number,
+            topics: [ ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])") ]
+        });
+
+        for (const l of logs) {
+            const parsed = this.rollup.interface.parseLog(l);
+            await this.checkBlockPerf(parsed.args[0], l.transactionHash, "REALTIME");
+        }
     }
 
     async predictDuties(currentEpoch, currentSlot) {
@@ -132,7 +315,6 @@ class Aztecanary {
 
         for (let e = BigInt(currentEpoch); e <= maxEpoch; e++) {
             const epochKey = e.toString();
-            // Only process once per epoch
             if (this.processedEpochs.has(epochKey)) continue;
 
             const data = await this.ensureEpochData(e);
@@ -141,19 +323,16 @@ class Aztecanary {
             const isCurrent = e === BigInt(currentEpoch);
             const tag = isCurrent ? "CURRENT" : "FUTURE";
 
-            // 1. Committee Check
             const inCommittee = data.committee.filter(val => TARGET_SEQUENCERS.has(val));
             if (inCommittee.length > 0) {
-                log("COMMITTEE", `[${tag}] Epoch ${e}: Targets in committee`, { validators: inCommittee });
+                log("COMMITTEE", `[${tag}] Epoch ${e}: Targets in committee`, { count: inCommittee.length, validators: inCommittee });
             } else {
                 if (isCurrent) log("WARN", `[${tag}] Epoch ${e}: No targets in committee`);
             }
 
-            // 2. Proposer Schedule
             const startSlot = e * this.config.epochDuration;
             for (let i = 0n; i < this.config.epochDuration; i++) {
                 const slot = startSlot + i;
-                // Don't log past duties for current epoch here, VerifyHistory handles that
                 if (isCurrent && slot < currentSlot) continue; 
 
                 const proposerIndex = computeProposerIndex(e, slot, data.seed, BigInt(data.committee.length));
@@ -171,150 +350,14 @@ class Aztecanary {
         }
     }
 
-    // SCANS the current epoch for missed blocks
-    async verifyCurrentEpochHistory(currentL1Block) {
-        try {
-            const ts = BigInt(currentL1Block.timestamp);
-            const currentSlot = (ts - this.config.genesisTime) / this.config.slotDuration;
-            const epoch = currentSlot / this.config.epochDuration;
-            const startSlot = epoch * this.config.epochDuration;
-
-            log("AUDIT", `Verifying history for Epoch ${epoch} (Slots ${startSlot} to ${currentSlot})`);
-
-            const data = await this.ensureEpochData(epoch);
-            if (!data) return;
-
-            // 1. Find all slots in the past of this epoch assigned to our targets
-            const assignedSlots = new Map(); // Slot -> Validator
-            for (let s = startSlot; s < currentSlot; s++) {
-                const pIdx = computeProposerIndex(epoch, s, data.seed, BigInt(data.committee.length));
-                const pAddr = data.committee[Number(pIdx)];
-                if (TARGET_SEQUENCERS.has(pAddr)) {
-                    assignedSlots.set(s.toString(), pAddr);
-                }
-            }
-
-            if (assignedSlots.size === 0) return;
-
-            // 2. Fetch L2BlockProposed logs for the last N blocks to find what actually happened
-            // Approximation: 12s L1 blocks. 
-            const slotsElapsed = Number(currentSlot - startSlot);
-            const l1BlocksLookback = Math.ceil((slotsElapsed * Number(this.config.slotDuration)) / 12) + 50; 
-            const fromBlock = currentL1Block.number - l1BlocksLookback;
-
-            const filter = {
-                address: ROLLUP_ADDRESS,
-                fromBlock: fromBlock,
-                toBlock: "latest",
-                topics: [ ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])") ]
-            };
-
-            const logs = await this.provider.getLogs(filter);
-            const filledSlots = new Set();
-
-            // 3. Check logs to see which slots were filled
-            // We need to call getBlock to map L2BlockNum -> Slot
-            // To be efficient, we'll do a batch of promises
-            const checks = logs.map(async (l) => {
-                const parsed = this.rollup.interface.parseLog(l);
-                const blockNum = parsed.args[0];
-                const blockData = await this.rollup.getBlock(blockNum);
-                filledSlots.add(blockData.slotNumber.toString());
-            });
-            await Promise.all(checks);
-
-            // 4. Compare
-            for (const [slotStr, validator] of assignedSlots.entries()) {
-                if (filledSlots.has(slotStr)) {
-                    // Success is silent for history to reduce noise, or verify log level
-                } else {
-                    log("PERF_MISS", `HISTORICAL: Target ${validator} missed proposal for Slot ${slotStr} in current Epoch ${epoch}`);
-                }
-            }
-
-        } catch (e) {
-            log("ERROR", "History verification failed", { error: e.message });
-        }
-    }
-
-    async processRealtimeBlock(logEvent, txHash, epochData) {
-        try {
-            const tx = await this.provider.getTransaction(txHash);
-            if (!tx) return;
-            const decoded = this.iface.parseTransaction({ data: tx.data, value: tx.value });
-            if (!decoded || decoded.name !== 'propose') return;
-
-            const slot = decoded.args._args.header.slotNumber;
-            const l2BlockNum = logEvent.args[0];
-            const actualProposer = tx.from.toLowerCase();
-            
-            // Derive info
-            const blockEpoch = slot / this.config.epochDuration;
-            let data = epochData;
-            if (blockEpoch !== this.config.currentEpoch) data = await this.ensureEpochData(blockEpoch);
-
-            if (!data) return;
-
-            const expectedIndex = computeProposerIndex(blockEpoch, slot, data.seed, BigInt(data.committee.length));
-            const expectedProposer = data.committee[Number(expectedIndex)];
-
-            // Proposer Check
-            if (TARGET_SEQUENCERS.has(expectedProposer)) {
-                if (expectedProposer === actualProposer) {
-                    log("PERF_SUCCESS", `Block ${l2BlockNum} proposed by ${expectedProposer}`);
-                } else {
-                    log("PERF_MISS", `Block ${l2BlockNum} MISSED by ${expectedProposer}. Taken by ${actualProposer}`);
-                }
-            }
-
-            // Attestation Check (Previous Block)
-            // Attestations included here are for the parent block.
-            data.committee.forEach((validator, index) => {
-                if (TARGET_SEQUENCERS.has(validator)) {
-                    if (!checkAttestation(decoded.args._attestations.signatureIndices, index)) {
-                        log("ATTEST_MISS", `Target ${validator} missed attestation for previous block`);
-                    }
-                }
-            });
-
-        } catch (e) { log("ERROR", "Realtime check failed", { error: e.message }); }
-    }
-
-    async handleBlock(block) {
-        const ts = BigInt(block.timestamp);
-        const slot = (ts - this.config.genesisTime) / this.config.slotDuration;
-        const epoch = slot / this.config.epochDuration;
-
-        if (Number(block.number) % 10 === 0) {
-            console.log(`[Heartbeat] L1: ${block.number} | Epoch: ${epoch} | Slot: ${slot}`);
-        }
-
-        const data = await this.ensureEpochData(epoch);
-        if (!data) return;
-
-        this.config.currentEpoch = epoch;
-        await this.predictDuties(epoch, slot);
-
-        // Process Logs
-        const logs = await this.provider.getLogs({
-            address: ROLLUP_ADDRESS,
-            fromBlock: block.number,
-            toBlock: block.number,
-            topics: [ ethers.id("L2BlockProposed(uint256,bytes32,bytes32[])") ]
-        });
-
-        for (const l of logs) {
-            await this.processRealtimeBlock(this.rollup.interface.parseLog(l), l.transactionHash, data);
-        }
-    }
-
     async start() {
         await this.init();
         this.provider.on("block", async (bn) => {
             if (bn % HEALTH_CHECK_INTERVAL_BLOCKS === 0) await this.checkValidatorStatus();
-            await this.handleBlock(await this.provider.getBlock(bn));
+            const block = await this.provider.getBlock(bn);
+            await this.handleBlock(block, true);
         });
-        log("INFO", `Monitoring ${TARGET_SEQUENCERS.size} targets`);
+        log("INFO", `Monitoring active for ${TARGET_SEQUENCERS.size} targets`);
     }
 }
 
