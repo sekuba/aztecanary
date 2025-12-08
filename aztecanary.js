@@ -445,9 +445,11 @@ class Aztecanary {
             const attMsg = dutyInfo.currentAttesters.length
                 ? `currently attesting: ${dutyInfo.currentAttesters.map(shortAddr).join(", ")}`
                 : "none";
-            const propMsg = dutyInfo.proposals.length
-                ? dutyInfo.proposals
-                    .sort((a, b) => (a.slot === b.slot ? 0 : a.slot < b.slot ? -1 : 1))
+            const upcomingProposals = dutyInfo.proposals
+                .filter(p => p.inSeconds >= 0)
+                .sort((a, b) => (a.slot === b.slot ? 0 : a.slot < b.slot ? -1 : 1));
+            const propMsg = upcomingProposals.length
+                ? upcomingProposals
                     .map(p => `${shortAddr(p.sequencer)}@${p.slot.toString()} in ${formatDuration(p.inSeconds)}`)
                     .join("; ")
                 : "none";
@@ -491,9 +493,10 @@ class Aztecanary {
             const epochKey = e.toString();
             const isCurrent = e === BigInt(currentEpoch);
             const alreadyProcessed = this.processedEpochs.has(epochKey);
-            if (!isCurrent && alreadyProcessed) continue;
 
-            const data = await this.ensureEpochData(e);
+            const data = (alreadyProcessed && this.epochCache.has(e))
+                ? this.epochCache.get(e)
+                : await this.ensureEpochData(e);
             if (!data) continue;
 
             const inCommittee = data.committee.filter(val => TARGET_SEQUENCERS.has(val));
