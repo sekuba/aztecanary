@@ -24,6 +24,7 @@ const TARGET_SEQUENCERS = new Set(
 );
 
 const ROLLUP_ADDRESS = "0x603bb2c05D474794ea97805e8De69bCcFb3bCA12";
+const ROLLUP_ADDRESS_LC = ROLLUP_ADDRESS.toLowerCase();
 
 const ROLLUP_ABI = [
     // Events
@@ -42,6 +43,12 @@ const ROLLUP_ABI = [
     "function propose(tuple(bytes32 archive, tuple(tuple(bytes32 root, uint32 nextAvailableLeafIndex) l1ToL2MessageTree, tuple(tuple(bytes32 root, uint32 nextAvailableLeafIndex) noteHashTree, tuple(bytes32 root, uint32 nextAvailableLeafIndex) nullifierTree, tuple(bytes32 root, uint32 nextAvailableLeafIndex) publicDataTree) partialStateReference) stateReference, tuple(int256 feeAssetPriceModifier) oracleInput, tuple(bytes32 lastArchiveRoot, tuple(bytes32 blobsHash, bytes32 inHash, bytes32 outHash) contentCommitment, uint256 slotNumber, uint256 timestamp, address coinbase, bytes32 feeRecipient, tuple(uint128 feePerDaGas, uint128 feePerL2Gas) gasFees, uint256 totalManaUsed) header) _args, tuple(bytes signatureIndices, bytes signaturesOrAddresses) _attestations, address[] _signers, tuple(uint8 v, bytes32 r, bytes32 s) _attestationsAndSignersSignature, bytes _blobInput)"
 ];
 
+// Multicall (propose is sometimes wrapped)
+const MULTICALL_ABI = [
+    "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) payable returns (tuple(bool success, bytes returnData)[] returnData)",
+    "function aggregate3Value(tuple(address target, bool allowFailure, uint256 value, bytes callData)[] calls) payable returns (tuple(bool success, bytes returnData)[] returnData)"
+];
+
 // --- Helpers ---
 
 function log(type, message, data = {}) {
@@ -55,6 +62,40 @@ function computeProposerIndex(epoch, slot, seed, committeeSize) {
         [epoch, slot, seed]
     );
     return BigInt(ethers.keccak256(packed)) % BigInt(committeeSize);
+}
+
+function decodeProposeFromTx(tx, rollupIface, multicallIface) {
+    // 1) Direct call to rollup.propose
+    try {
+        const decoded = rollupIface.parseTransaction({ data: tx.data, value: tx.value });
+        if (decoded && decoded.name === "propose") {
+            return decoded;
+        }
+    } catch (_) {}
+
+    // 2) Multicall wrappers (aggregate3 / aggregate3Value)
+    try {
+        const multi = multicallIface.parseTransaction({ data: tx.data, value: tx.value });
+        if (!multi || (multi.name !== "aggregate3" && multi.name !== "aggregate3Value")) return null;
+
+        for (const call of multi.args[0]) {
+            // tuple layout differs slightly between aggregate3 and aggregate3Value
+            const target = (call.target || call[0] || "").toLowerCase();
+            if (target !== ROLLUP_ADDRESS_LC) continue;
+
+            const innerData = call.callData || call[3] || call[2];
+            if (!innerData) continue;
+
+            try {
+                const decodedInner = rollupIface.parseTransaction({ data: innerData });
+                if (decodedInner && decodedInner.name === "propose") {
+                    return decodedInner;
+                }
+            } catch (_) { continue; }
+        }
+    } catch (_) {}
+
+    return null;
 }
 
 function checkAttestation(signatureIndicesBytes, index) {
@@ -77,6 +118,7 @@ class Aztecanary {
         this.provider = new ethers.JsonRpcProvider(RPC_URL);
         this.rollup = new ethers.Contract(ROLLUP_ADDRESS, ROLLUP_ABI, this.provider);
         this.iface = new ethers.Interface(ROLLUP_ABI);
+        this.mcIface = new ethers.Interface(MULTICALL_ABI);
         
         this.config = {};
         this.processedEpochs = new Set();
@@ -158,13 +200,30 @@ class Aztecanary {
         try {
             const tx = await this.provider.getTransaction(txHash);
             if (!tx) return;
-            const decoded = this.iface.parseTransaction({ data: tx.data, value: tx.value });
-            if (!decoded || decoded.name !== 'propose') return;
 
-            const header = decoded.args._args.header;
-            const attestations = decoded.args._attestations;
-            const slot = header.slotNumber;
+            const decoded = decodeProposeFromTx(tx, this.iface, this.mcIface);
+            if (!decoded) {
+                log("DEBUG", `[${context}] Tx ${txHash} is not a rollup.propose call (or failed to decode)`);
+                return;
+            }
+
+            const args = decoded.args;
+            const callArgs = args._args || args[0];
+            if (!callArgs || !callArgs.header) {
+                log("ERROR", `[${context}] Missing header data in decoded propose`, { tx: txHash });
+                return;
+            }
+
+            const header = callArgs.header;
+            const attestations = args._attestations || args[1];
+            if (!attestations || !attestations.signatureIndices) {
+                log("ERROR", `[${context}] Missing attestation payload in propose tx`, { tx: txHash });
+                return;
+            }
+
+            const slot = BigInt(header.slotNumber.toString());
             const actualProposer = tx.from.toLowerCase();
+            const sigBytes = ethers.getBytes(attestations.signatureIndices);
 
             // Stats for this block
             let stats = { proposer: "N/A", attests: 0, targetAttests: 0 };
@@ -188,30 +247,36 @@ class Aztecanary {
                 }
             }
 
-            // --- 2. Attestation Check ---
-            const parentSlot = slot - 1n;
-            const parentEpoch = parentSlot / this.config.epochDuration;
-            const parentData = (parentEpoch === epoch) ? epochData : await this.ensureEpochData(parentEpoch);
+            // --- 2. Attestation Check (current block committee) ---
+            if (epochData) {
+                const targetsInCommittee = epochData.committee.filter(v => TARGET_SEQUENCERS.has(v));
+                // log("ATTEST_DEBUG", `[${context}] Committee info`, { 
+                //     l2Block: l2BlockNum.toString(),
+                //     epoch: epoch.toString(),
+                //     committeeSize: epochData.committee.length,
+                //     sigBytes: sigBytes.length,
+                //     targetsInCommittee: targetsInCommittee.length
+                // });
 
-            if (parentData) {
-                let targetsInCommittee = 0;
-                parentData.committee.forEach((validator, index) => {
+                let checkedTargets = 0;
+                epochData.committee.forEach((validator, index) => {
                     if (TARGET_SEQUENCERS.has(validator)) {
-                        targetsInCommittee++;
+                        checkedTargets++;
                         const didAttest = checkAttestation(attestations.signatureIndices, index);
                         if (!didAttest) {
-                            log("ATTEST_MISS", `[${context}] Target ${validator} missed attestation for parent of Block ${l2BlockNum}`);
+                            log("ATTEST_MISS", `[${context}] Target ${validator} missed attestation for Block ${l2BlockNum}`);
                         } else {
                             stats.targetAttests++;
-                            log("ATTEST_OK", `[${context}] Target ${validator} attested to parent of Block ${l2BlockNum}`);
+                            log("ATTEST_OK", `[${context}] Target ${validator} attested to Block ${l2BlockNum}`);
                         }
                     }
                 });
                 
-                // If we found targets in the committee but they weren't checked above, logic error
-                if (targetsInCommittee > 0) {
-                   log("DEBUG", `Checked ${targetsInCommittee} targets for attestations in Block ${l2BlockNum}`);
+                if (checkedTargets > 0) {
+                //    log("DEBUG", `Checked ${checkedTargets} targets for attestations in Block ${l2BlockNum}`);
                 }
+            } else {
+                log("DEBUG", `[${context}] Missing epoch data for attestation check`, { epoch: epoch.toString(), l2Block: l2BlockNum.toString() });
             }
             
             log("PERF_CHECK", `Analyzed Block ${l2BlockNum}`, { context, slot: slot.toString(), targetsAttested: stats.targetAttests });
