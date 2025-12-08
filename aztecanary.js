@@ -411,6 +411,10 @@ class Aztecanary {
             if (inCommittee.length > 0) {
                 log("COMMITTEE", `[${tag}] Epoch ${e}: Targets in committee`, { count: inCommittee.length, validators: inCommittee });
                 if (isCurrent) currentTargets = inCommittee.length;
+                if (nextDuty.slot === null) {
+                    const slotHint = isCurrent ? currentSlot : (e * this.config.epochDuration);
+                    nextDuty = { slot: slotHint, epoch: e };
+                }
             } else {
                 if (isCurrent) log("WARN", `[${tag}] Epoch ${e}: No targets in committee`);
             }
