@@ -2,7 +2,7 @@ const { ethers } = require("ethers");
 
 const RPC_URL = process.env.RPC_URL || "http://127.0.0.1:8545";
 const HEALTH_CHECK_INTERVAL_BLOCKS = 50;
-const HISTORY_LOOKBACK_BLOCKS = 300;
+const L1_BLOCK_TIME_SEC = 12n; // Post-merge Ethereum block time assumption
 
 const rawTargets = (process.env.TARGETS || "").split(",");
 const TARGET_SEQUENCERS = new Set(
@@ -180,24 +180,17 @@ class Aztecanary {
     }
 
     async resolveActualProposer(tx, decoded, txHash) {
-        const args = decoded?.args || [];
-        const rawSigners = args._signers || args[2] || [];
-        const signers = Array.from(rawSigners || []).map(s => (typeof s === "string" ? s : s.toString()).toLowerCase());
-
-        let proposer = null;
-        if (tx && tx.blockNumber !== null && tx.blockNumber !== undefined) {
-            try {
-                const onChain = await this.rollup.getCurrentProposer({ blockTag: tx.blockNumber });
-                if (onChain) proposer = onChain.toLowerCase();
-            } catch (e) {
-                log("DEBUG", `Failed to read current proposer for tx ${txHash}`, { block: tx.blockNumber, error: e.message });
-            }
+        if (!tx || tx.blockNumber === null || tx.blockNumber === undefined) {
+            log("ERROR", `Missing block number for proposer resolution`, { tx: txHash });
+            return null;
         }
-
-        if (!proposer && signers.length > 0) proposer = signers[0];
-        if (!proposer && tx && tx.from) proposer = tx.from.toLowerCase();
-
-        return proposer;
+        try {
+            const onChain = await this.rollup.getCurrentProposer({ blockTag: tx.blockNumber });
+            return onChain ? onChain.toLowerCase() : null;
+        } catch (e) {
+            log("ERROR", `Failed to read current proposer for tx ${txHash}`, { block: tx.blockNumber, error: e.message });
+            return null;
+        }
     }
 
     async markMissedSlotsUntil(currentSlot, context = "REALTIME") {
@@ -225,7 +218,7 @@ class Aztecanary {
             const expectedProposer = epochData.committee[Number(proposerIdx)];
 
             if (TARGET_SEQUENCERS.has(expectedProposer)) {
-                log("PROPOSAL_MISS", `[${context}] Slot ${slot} missed by tracked sequencer ${expectedProposer} (no proposal observed)`);
+                log("DUTY:PROPOSAL_MISS", `[${context}] Slot ${slot} missed by tracked sequencer ${expectedProposer} (no proposal observed)`);
             }
         }
 
@@ -273,7 +266,8 @@ class Aztecanary {
 
             const epoch = slot / this.config.epochDuration;
             const epochData = await this.ensureEpochData(epoch);
-            const actualProposer = (await this.resolveActualProposer(tx, decoded, txHash)) || "unknown";
+            const actualProposer = await this.resolveActualProposer(tx, decoded, txHash);
+            if (!actualProposer) return;
             const stats = { trackedAttests: 0, expectedProposer: null, actualProposer };
             this.proposedSlots.add(slot.toString());
 
@@ -288,12 +282,10 @@ class Aztecanary {
                 if (TARGET_SEQUENCERS.has(expectedProposer)) {
                     if (!proposerMismatch) {
                         if (logProposalEvents) {
-                            log("PROPOSAL_OK", `[${context}] Block ${l2BlockNum} proposed by tracked sequencer ${expectedProposer}`);
+                            log("DUTY:PROPOSAL_OK", `[${context}] Block ${l2BlockNum} proposed by tracked sequencer ${expectedProposer}`);
                         }
                     } else {
-                        if (logProposalEvents) {
-                            log("PROPOSER_MISMATCH", `[${context}] Expected proposer ${expectedProposer} but resolved proposer ${actualProposer} for Block ${l2BlockNum} (Slot ${slot}). Indicates decode/lookup mismatch.`);
-                        }
+                        log("ERROR", `[${context}] Expected proposer ${expectedProposer} but resolved proposer ${actualProposer} for Block ${l2BlockNum} (Slot ${slot}). Indicates decode/lookup mismatch.`);
                         if (proposalMissSummary) {
                             const current = proposalMissSummary.get(expectedProposer) || [];
                             current.push({ slot: slot.toString(), by: actualProposer, l2Block: l2BlockNum.toString(), reason: "mismatch" });
@@ -333,7 +325,7 @@ class Aztecanary {
                                 attestationSummary.set(validator, current);
                             }
                         } else {
-                            if (logAttestations) log("ATTEST_MISS", `[${context}] Tracked sequencer ${validator} missed attesting to Block ${l2BlockNum}`);
+                            if (logAttestations) log("DUTY:ATTEST_MISS", `[${context}] Tracked sequencer ${validator} missed attesting to Block ${l2BlockNum}`);
                             if (attestationSummary) {
                                 const current = attestationSummary.get(validator) || { missed: 0, ok: 0, slotsMissed: [] };
                                 current.missed += 1;
@@ -378,7 +370,12 @@ class Aztecanary {
                 return;
             }
 
-            const fromBlock = Math.max(0, currentL1Block.number - HISTORY_LOOKBACK_BLOCKS);
+            // Compute a tight log range: from the start of the current epoch, using fixed 12s L1 block time and integral slot duration.
+            const slotsIntoEpoch = currentSlot - startSlot; // BigInt
+            const blocksPerSlot = this.config.slotDuration / L1_BLOCK_TIME_SEC; // BigInt, assumes exact multiple
+            const estimatedBlocksBack = Number(slotsIntoEpoch * blocksPerSlot);
+            const cushion = 3; // guard for minor timestamp drift
+            const fromBlock = Math.max(0, currentL1Block.number - estimatedBlocksBack - cushion);
             const filter = {
                 address: ROLLUP_ADDRESS,
                 fromBlock: fromBlock,
