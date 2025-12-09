@@ -14,6 +14,7 @@ This document captures the assumptions, invariants, and high-level logic impleme
 - RPC access is trusted and stable; no network retries are built in.
 
 ## Key constants
+- `TARGETS`: commma separated sequencer addresses to monitor
 - `RPC_URL`: JSON-RPC endpoint (env or default `http://127.0.0.1:8545`).
 - `HEALTH_CHECK_INTERVAL_BLOCKS`: how often to poll validator status (default 50 L1 blocks).
 - `lag`: read from chain; controls how far ahead we predict proposer duties.
@@ -31,10 +32,6 @@ This document captures the assumptions, invariants, and high-level logic impleme
 - Epoch index: `slot / epochDuration`.
 - Proposer index: `keccak256(epoch, slot, seed) mod committeeSize`.
 - Duty prediction: iterate slots for current and `lag` epochs using cached committee+seed.
-
-## Proposer resolution logic
-Call `rollup.getCurrentProposer` at the tx block tag; if it fails or returns empty, we abort processing for that tx and log an error.
-Proposer mismatches vs the deterministic expected proposer are treated as decode issues; attestation checks are skipped in that case.
 
 ## Attestation resolution logic
 - Prefer `_signers` for membership; fallback to `signatureIndices` bitset for a committee index when `_signers` does not include the validator.
