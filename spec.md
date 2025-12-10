@@ -42,7 +42,7 @@ For every tracked validator in the committee, the script checks presence in the 
 
 ### A. Real-Time Monitor (Default)
 Runs an infinite loop processing the L1 chain tip.
-1.  **Heartbeat**: Logs L1 block, Aztec Epoch/Slot once per slot (aligned to slot boundaries) and reports `Next duty in: <duration>` for the nearest upcoming tracked duty.
+1.  **Heartbeat**: Logs L1 block, Aztec Epoch/Slot once per slot (aligned to slot boundaries) and reports proposal ETA plus attestation status (`Attest: current epoch` or `Attest in: <duration>` if a tracked validator is in a future committee).
 2.  **Health Check**: Validator status is checked every slot; alerts fire on startup for non-`VALIDATING` or on any subsequent status change.
 3.  **Duty Prediction**: Once per epoch (or when the nearest duty changes), logs tracked proposal duties for the current epoch plus the lookahead lag (e.g., 3 epochs total if `lag=2`), annotating the nearest duty with a human-readable time to go.
 4.  **Event Processing**: Listens for `L2BlockProposed`. On event:

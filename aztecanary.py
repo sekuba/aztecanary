@@ -108,6 +108,9 @@ class Aztecanary:
         self.last_predicted_epoch: Optional[int] = None
         self.next_duty_slot: Optional[int] = None
         self.next_duty_slot_ts: Optional[float] = None
+        self.attest_current_epoch: bool = False
+        self.next_attest_epoch: Optional[int] = None
+        self.next_attest_ts: Optional[float] = None
 
     def init_chain_params(self):
         """Fetches immutable chain parameters."""
@@ -274,7 +277,7 @@ class Aztecanary:
             for _, validator in enumerate(committee):
                 if validator in self.targets:
                     if validator not in signers:
-                        logger.warning(f"[{context}] DUTY:ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}")
+                        logger.warning(f"[{context}] DUTY:ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}. txhash={tx_hash.hex()}")
                         missed_attesters.append(validator)
             
             return expected_proposer, missed_attesters
@@ -322,6 +325,9 @@ class Aztecanary:
         summaries = []
         nearest: Optional[Dict[str, Any]] = None
         now_ts = time.time()
+        attest_current = False
+        next_attest_epoch: Optional[int] = None
+        next_attest_ts: Optional[float] = None
 
         for e in range(start_epoch, start_epoch + lookahead_epochs + 1):
             data = self.get_epoch_data(e)
@@ -331,6 +337,13 @@ class Aztecanary:
             committee = data["committee"]
             start_slot = e * self.config["epoch_duration"]
             end_slot = start_slot + self.config["epoch_duration"]
+            targets_in_committee = any(v in self.targets for v in committee)
+            if targets_in_committee:
+                if e == start_epoch:
+                    attest_current = True
+                elif next_attest_epoch is None:
+                    next_attest_epoch = e
+                    next_attest_ts = self.config["genesis_time"] + (start_slot * self.config["slot_duration"])
 
             tracked_duties = []
             for s in range(max(start_slot, current_slot), end_slot):
@@ -359,6 +372,10 @@ class Aztecanary:
         else:
             self.next_duty_slot = None
             self.next_duty_slot_ts = None
+
+        self.attest_current_epoch = attest_current
+        self.next_attest_epoch = next_attest_epoch
+        self.next_attest_ts = next_attest_ts
 
         if summaries:
             logger.info(f"[DUTY] Upcoming Proposals: {' | '.join(summaries)}")
@@ -440,11 +457,19 @@ class Aztecanary:
                         self.predict_upcoming_duties(current_epoch, current_slot)
                         self.last_predicted_epoch = current_epoch
 
-                    next_duty_in = "N/A"
+                    # Proposal ETA
+                    next_proposal = "N/A"
                     if self.next_duty_slot_ts is not None:
-                        next_duty_in = format_duration(int(max(0, self.next_duty_slot_ts - time.time())))
+                        next_proposal = format_duration(int(max(0, self.next_duty_slot_ts - time.time())))
 
-                    logger.info(f"[Heartbeat] L1: {current_l1['number']} | Epoch: {current_epoch} | Slot: {current_slot} | Next duty in: {next_duty_in}")
+                    # Attestation status/ETA
+                    attest_info = "Attest: none"
+                    if self.attest_current_epoch:
+                        attest_info = "Attest: current epoch"
+                    elif self.next_attest_ts is not None and self.next_attest_epoch is not None:
+                        attest_info = f"Attest in: {format_duration(int(max(0, self.next_attest_ts - time.time())))} (Epoch {self.next_attest_epoch})"
+
+                    logger.info(f"[Heartbeat] L1: {current_l1['number']} | Epoch: {current_epoch} | Slot: {current_slot} | Next proposal in: {next_proposal} | {attest_info}")
                     self.check_validator_status()
                     self.check_missed_slots(current_slot)
                     last_slot = current_slot
