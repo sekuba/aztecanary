@@ -108,6 +108,7 @@ class Aztecanary:
         self.processed_slots: Set[int] = set()
         self.last_checked_slot: Optional[int] = None
         self.processed_epochs: Set[int] = set()
+        self.status_cache: Dict[str, str] = {}
 
     def init_chain_params(self):
         """Fetches immutable chain parameters."""
@@ -182,9 +183,17 @@ class Aztecanary:
                 # effective_balance = view[1]
                 
                 status_str = status_map.get(status_code, "UNKNOWN")
-                
-                if status_str != "VALIDATING":
+                previous_status = self.status_cache.get(target)
+                self.status_cache[target] = status_str
+
+                # Startup alert for non-validating statuses
+                if previous_status is None and status_str != "VALIDATING":
                     logger.warning(f"Sequencer {target} status is {status_str} (Balance: {self.w3.from_wei(view[1], 'ether')} ETH)")
+                    continue
+
+                # Alert only on status changes after startup
+                if previous_status is not None and status_str != previous_status:
+                    logger.warning(f"Sequencer {target} status changed: {previous_status} -> {status_str} (Balance: {self.w3.from_wei(view[1], 'ether')} ETH)")
             except Exception as e:
                 logger.error(f"Failed to check status for {target}: {e}")
 
