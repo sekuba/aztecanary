@@ -46,9 +46,9 @@ Runs an infinite loop processing the L1 chain tip.
 2.  **Health Check**: Validator status is checked every slot; alerts fire on startup for non-`VALIDATING` or on any subsequent status change.
 3.  **Duty Prediction**: Once per epoch (or when the nearest duty changes), logs tracked proposal duties for the current epoch plus the lookahead lag (e.g., 3 epochs total if `lag=2`), annotating the nearest duty with a human-readable time to go.
 4.  **Event Processing**: Listens for `L2BlockProposed`. On event:
-    *   Decodes the transaction and slot.
+    *   Decodes the transaction via Multicall3 `aggregate3` -> `propose` to extract `_signers` and slot.
     *   Assumes the proposal succeeded if the transaction landed; logs success for tracked proposers based on deterministic duty mapping.
-    *   Checks for missing attestations from tracked validators.
+    *   Checks for missing attestations from tracked validators (signer-list only).
 5.  **Silence Detection**: If the L1 chain advances but no L2 block is seen for a slot assigned to a tracked sequencer, triggers a **PROPOSAL MISS** alert.
 
 ### B. Historical Scan (`-scan [value]`)

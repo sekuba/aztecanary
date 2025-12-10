@@ -212,15 +212,10 @@ class Aztecanary:
     def decode_propose_tx(self, tx) -> Optional[Dict]:
         """
         Decodes a transaction to find the `propose` call arguments.
-        Handles direct propose and Multicall3 aggregate3 (0x82ad56cb) wrapping propose.
+        Handles Multicall3 aggregate3 (0x82ad56cb) wrapping propose.
         """
         input_hex = tx.input.hex()
         selector = f"0x{input_hex[:8]}"
-
-        # Direct call
-        direct = self._decode_propose_call(bytes.fromhex(input_hex))
-        if direct:
-            return direct
 
         # Multicall3 aggregate3
         try:
