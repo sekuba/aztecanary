@@ -196,24 +196,8 @@ class Aztecanary:
             if getattr(fn, "fn_name", "") != "propose":
                 return None
 
-            signers = [to_checksum_address(s) for s in params.get("_signers", [])]
-            slot_num = None
-
-            args_struct = params.get("_args")
-            if args_struct is not None:
-                header = args_struct.get("header") if hasattr(args_struct, "get") else None
-                if header is None and isinstance(args_struct, (list, tuple)) and args_struct:
-                    header = args_struct[3] if len(args_struct) >= 4 else args_struct[-1]
-                if header is not None:
-                    if hasattr(header, "get"):
-                        slot_num = header.get("slotNumber")
-                    elif isinstance(header, (list, tuple)) and header:
-                        slot_num = header[2] if len(header) > 2 else header[-1]
-
-            if slot_num is None:
-                logger.error("decode_propose_call failure: slotNumber missing in decoded args")
-                return None
-
+            signers = [to_checksum_address(s) for s in params["_signers"]]
+            slot_num = params["_args"]["header"]["slotNumber"]
             return {"_signers": signers, "slot": slot_num}
         except Exception as e:
             prefix = call_data[:16].hex()
@@ -233,28 +217,22 @@ class Aztecanary:
 
         selector = input_hex[:10]
 
-        if selector != AGGREGATE3_SELECTOR:
-            return None
+        if selector == AGGREGATE3_SELECTOR:
+            try:
+                raw_data = bytes.fromhex(input_hex[10:])
+                decoded_calls = decode(['(address,bool,bytes)[]'], raw_data)[0]
+            except Exception as e:
+                logger.error(f"decode_propose_tx aggregate3 decode failure: {e}", exc_info=True)
+                return None
 
-        try:
-            raw_data = bytes.fromhex(input_hex[10:])
-            decoded_calls = decode(['(address,bool,bytes)[]'], raw_data)[0]
-        except Exception as e:
-            logger.error(f"decode_propose_tx aggregate3 decode failure: {e}", exc_info=True)
-            return None
-
-        for (target, _, call_data) in decoded_calls:
-            if to_checksum_address(target) == ROLLUP_ADDRESS:
-                if len(call_data) < 4:
-                    logger.error(f"decode_propose_tx: call_data too short ({len(call_data)}) for rollup target in tx {tx.hash.hex()}")
-                    continue
-                inner_selector = call_data[:4].hex()
-                if inner_selector != PROPOSE_SELECTOR[2:]:
-                    logger.error(f"decode_propose_tx: unexpected inner selector 0x{inner_selector} for rollup target in tx {tx.hash.hex()}")
-                    continue
-                propose = self._decode_propose_call(call_data)
-                if propose:
-                    return propose
+            for (target, _, call_data) in decoded_calls:
+                if to_checksum_address(target) == ROLLUP_ADDRESS:
+                    if len(call_data) < 4:
+                        logger.error(f"decode_propose_tx: call_data too short ({len(call_data)}) for rollup target in tx {tx.hash.hex()}")
+                        continue
+                    propose = self._decode_propose_call(call_data)
+                    if propose:
+                        return propose
         return None
 
     def analyze_block_perf(self, l2_block_num: int, tx_hash: str, context: str = "REALTIME") -> Tuple[Optional[str], List[str], Optional[List[str]], List[str]]:
@@ -270,10 +248,8 @@ class Aztecanary:
                 return None, [], None, []
 
             # Extract from tx args and on-chain block view
-            signers = args.get('_signers') or args.get('signers') or []
-            slot = args.get("slot")
-            if slot is None:
-                logger.error(f"[{context}] Slot not found in tx decode for L2 block {l2_block_num}; fetching on-chain")
+            signers = args["_signers"]
+            slot = args["slot"]
 
             self.processed_slots.add(slot)
             
