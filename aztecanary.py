@@ -200,14 +200,16 @@ class Aztecanary:
                 logger.error(f"Failed to check status for {target}: {e}")
 
     def _decode_propose_call(self, call_data: bytes) -> Optional[Dict]:
-        """Decodes a propose call payload to extract signers."""
+        """Decodes a propose call payload to extract signers and slot."""
         if call_data[:4].hex() != PROPOSE_SELECTOR[2:]:
             return None
 
         try:
             decoded = decode(PROPOSE_PARAM_TYPES, call_data[4:])
             signers = [to_checksum_address(s) for s in decoded[2]]
-            return {"_signers": signers}
+            # slotNumber is within header tuple (index 3), at position 2
+            slot_num = decoded[0][3][2]
+            return {"_signers": signers, "slot": slot_num}
         except Exception as e:
             logger.error(f"decode_propose_call failure: {e}", exc_info=True)
             return None
@@ -233,30 +235,31 @@ class Aztecanary:
         logger.error(f"decode_propose_tx failure selector={selector} len={len(tx.input)} tx={tx.hash.hex()}", exc_info=True)
         return None
 
-    def analyze_block_perf(self, l2_block_num: int, tx_hash: str, context: str = "REALTIME") -> Tuple[Optional[str], List[str]]:
+    def analyze_block_perf(self, l2_block_num: int, tx_hash: str, context: str = "REALTIME") -> Tuple[Optional[str], List[str], Optional[List[str]], List[str]]:
         """
         Analyzes a specific L2 block proposal for proposer correctness and attestations.
-        Returns (ProposerAddress, List[MissedAttesters]).
+        Returns (ProposerAddress, List[MissedAttesters], Committee, Signers).
         """
         try:
-            block_view = self.rollup.functions.getBlock(l2_block_num).call()
-            slot = block_view[5]  # slotNumber
-            self.processed_slots.add(slot)
-
             tx = self.w3.eth.get_transaction(tx_hash)
             args = self.decode_propose_tx(tx)
             if not args:
                 logger.error(f"[{context}] Could not decode propose tx for L2 block {l2_block_num}; duty checks incomplete")
-                return None, []
+                return None, [], None, []
 
             # Extract from tx args and on-chain block view
             signers = args.get('_signers') or args.get('signers') or []
+            slot = args.get("slot")
+            if slot is None:
+                logger.error(f"[{context}] Slot not found in tx decode for L2 block {l2_block_num}; fetching on-chain")
+
+            self.processed_slots.add(slot)
             
             epoch = slot // self.config['epoch_duration']
             epoch_data = self.get_epoch_data(epoch)
             
             if not epoch_data or not epoch_data.get("committee"):
-                return None, []
+                return None, [], None, []
 
             committee = epoch_data['committee']
             committee_size = len(committee)
@@ -268,7 +271,7 @@ class Aztecanary:
                 if expected_proposer in self.targets:
                     logger.info(f"[{context}] DUTY: PROPOSAL_OK - Block {l2_block_num} (Slot {slot}) proposed by tracked {expected_proposer[:8]}")
         
-            missed_attesters = []
+            missed_attesters: List[str] = []
 
             # Verify attestations using signer list only
             for _, validator in enumerate(committee):
@@ -277,11 +280,11 @@ class Aztecanary:
                         logger.warning(f"[{context}] DUTY: ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}. txhash={tx_hash.hex()}")
                         missed_attesters.append(validator)
             
-            return expected_proposer, missed_attesters
+            return expected_proposer, missed_attesters, committee, signers
 
         except Exception as e:
             logger.error(f"[{context}] Error analyzing block {l2_block_num}: {e}")
-            return None, []
+            return None, [], None, []
 
     def check_missed_slots(self, current_slot: int):
         """Checks if any slots between last check and now were missed (empty)."""
@@ -381,14 +384,16 @@ class Aztecanary:
         """Historical scan mode."""
         self.init_chain_params()
         
-        # Parse lookback
+        # Parse lookback (supports hours: h, days: d, epochs: e, or raw blocks)
         blocks_to_scan = 0
-        if lookback_str.lower().endswith("h"):
-            hours = int(lookback_str[:-1])
+        look = lookback_str.lower()
+        if look.endswith("h"):
+            hours = int(look[:-1])
             blocks_to_scan = (hours * 3600) // L1_BLOCK_TIME_SEC
-        elif lookback_str.lower().endswith("d"):
-            days = int(lookback_str[:-1])
-            blocks_to_scan = (days * 86400) // L1_BLOCK_TIME_SEC
+        elif look.endswith("e"):
+            epochs = int(look[:-1])
+            seconds = epochs * self.config["epoch_duration"] * self.config["slot_duration"]
+            blocks_to_scan = seconds // L1_BLOCK_TIME_SEC
         else:
             blocks_to_scan = int(lookback_str)
 
@@ -397,28 +402,77 @@ class Aztecanary:
         
         logger.info(f"Starting Historical Scan from L1 Block {from_block} to {current_l1} (~{blocks_to_scan} blocks)")
         
-        # 1. Fetch Logs
         logs = self.rollup.events.L2BlockProposed.get_logs(from_block=from_block, to_block=current_l1)
         logger.info(f"Found {len(logs)} L2 Blocks proposed in range.")
         
+        validator_stats: Dict[str, Dict[str, int]] = {
+            v: {"proposal_ok": 0, "proposal_miss": 0, "attest_ok": 0, "attest_miss": 0}
+            for v in self.targets
+        }
+        observed_slots: Set[int] = set()
         missed_props = 0
         missed_attests = 0
+        min_slot = None
+        max_slot = None
         
         for log in logs:
             l2_block = log['args']['blockNumber']
-            _, misses = self.analyze_block_perf(l2_block, log['transactionHash'], context="HISTORY")
+            slot = None
+            try:
+                tx = self.w3.eth.get_transaction(log['transactionHash'])
+                decoded = self.decode_propose_tx(tx)
+                if decoded and decoded.get("slot") is not None:
+                    slot = decoded["slot"]
+            except Exception as e:
+                logger.error(f"[HISTORY] Unable to resolve slot for block {l2_block}: {e}")
+
+            if slot is None:
+                logger.error(f"[HISTORY] Skipping block {l2_block}; slot unknown")
+                continue
+
+            observed_slots.add(slot)
+            min_slot = slot if min_slot is None else min(min_slot, slot)
+            max_slot = slot if max_slot is None else max(max_slot, slot)
+
+            expected, misses, committee, signers = self.analyze_block_perf(l2_block, log['transactionHash'], context="HISTORY")
             if misses:
                 missed_attests += len(misses)
-                
-        # To check for missed proposals in history, we need to reconstruct the full slot map
-        # This is expensive for long ranges, so strictly checking "observed" blocks for attestations 
-        # and checking if any observed blocks were supposed to be ours but weren't (difficult without full map).
-        # We will iterate known logs.
+            # Proposal stats
+            if expected and expected in self.targets:
+                validator_stats[expected]["proposal_ok"] += 1
+            # Attestation stats
+            if committee is not None:
+                for val in committee:
+                    if val in self.targets:
+                        if signers and val in signers:
+                            validator_stats[val]["attest_ok"] += 1
+                        else:
+                            validator_stats[val]["attest_miss"] += 1
         
-        # Simplified Audit Summary
+        # Missed proposals: iterate slot range covered by observed logs
+        if min_slot is not None and max_slot is not None:
+            for s in range(min_slot, max_slot + 1):
+                if s in observed_slots:
+                    continue
+                
+                epoch = s // self.config['epoch_duration']
+                epoch_data = self.get_epoch_data(epoch)
+                if not epoch_data or not epoch_data['committee']:
+                    continue
+
+                proposer_idx = compute_proposer_index(epoch, s, epoch_data['seed'], len(epoch_data['committee']))
+                expected_proposer = epoch_data['committee'][proposer_idx]
+                if expected_proposer in self.targets:
+                    missed_props += 1
+                    validator_stats[expected_proposer]["proposal_miss"] += 1
+                    logger.warning(f"[HISTORY] DUTY:PROPOSAL_MISS - Slot {s} missed by tracked {expected_proposer}")
+        
         logger.info("-" * 40)
         logger.info(f"Scan Complete. Observed L2 Blocks: {len(logs)}")
         logger.info(f"Attestation Misses (Tracked): {missed_attests}")
+        logger.info(f"Proposal Misses (Tracked): {missed_props}")
+        for val, stats in validator_stats.items():
+            logger.info(f"[STATS] {val[:8]} proposals ok/miss: {stats['proposal_ok']}/{stats['proposal_miss']} | attests ok/miss: {stats['attest_ok']}/{stats['attest_miss']}")
         logger.info("-" * 40)
 
     def run_realtime(self):

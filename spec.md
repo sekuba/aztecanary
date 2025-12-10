@@ -52,11 +52,11 @@ Runs an infinite loop processing the L1 chain tip.
 5.  **Silence Detection**: If the L1 chain advances but no L2 block is seen for a slot assigned to a tracked sequencer, triggers a **PROPOSAL MISS** alert.
 
 ### B. Historical Scan (`-scan [value]`)
-Audits past performance over a defined range (e.g., `24h` or `100` blocks).
-1.  Calculates `from_block` based on the lookback value and 12s block time.
-2.  Fetches all `L2BlockProposed` logs in range.
-3.  Performs the **Attestation Verification** logic on every log found.
-4.  Outputs a summary of total blocks observed and total attestations missed.
+Audits past performance over a defined range (`24h`, `10d`, `50` blocks, or `5e` epochs).
+1.  Calculates `from_block` based on the lookback value (epochs converted via epoch/slot durations, hours/days via 12s L1 time).
+2.  Fetches all `L2BlockProposed` logs in range and decodes each for attestation checks.
+3.  Reconstructs the slot range covered by observed logs and flags missed proposals for tracked proposers if a slot lacked a corresponding proposal.
+4.  Outputs totals for observed blocks, attestation misses, and proposal misses.
 
 ## 5. Logging Levels
 *   **[INFO]**: Normal operation, heartbeats, upcoming duties.
