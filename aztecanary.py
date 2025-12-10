@@ -31,7 +31,6 @@ RPC_URL = os.environ.get("RPC_URL", "http://127.0.0.1:8545")
 TARGETS_ENV = os.environ.get("TARGETS", "")
 ROLLUP_ADDRESS = "0x603bb2c05D474794ea97805e8De69bCcFb3bCA12"
 L1_BLOCK_TIME_SEC = 12
-HEALTH_CHECK_INTERVAL_BLOCKS = 50
 
 # Minimal ABIs for interactions
 ROLLUP_ABI = [
@@ -107,8 +106,8 @@ class Aztecanary:
         self.epoch_cache: Dict[int, Dict[str, Any]] = {}  # {epoch: {committee: [], seed: int}}
         self.processed_slots: Set[int] = set()
         self.last_checked_slot: Optional[int] = None
-        self.processed_epochs: Set[int] = set()
         self.status_cache: Dict[str, str] = {}
+        self.last_predicted_epoch: Optional[int] = None
 
     def init_chain_params(self):
         """Fetches immutable chain parameters."""
@@ -328,46 +327,32 @@ class Aztecanary:
         
         self.last_checked_slot = current_slot
 
-    def predict_upcoming_duties(self, current_epoch: int, current_slot: int):
-        """Logs upcoming proposal duties for tracked sequencers."""
+    def predict_upcoming_duties(self, start_epoch: int, current_slot: int):
+        """Logs proposal duties for tracked sequencers for current epoch plus lag."""
         lookahead_epochs = self.config['lag']
-        now_ts = time.time()
-        
-        # Only log prediction if we entered a new epoch or haven't done so recently
-        
-        upcoming = []
-        
-        for e in range(current_epoch, current_epoch + lookahead_epochs + 1):
-            if e in self.processed_epochs: 
-                continue
-            
-            data = self.get_epoch_data(e)
-            if not data: continue
-            
-            committee = data['committee']
-            targets_in_committee = [v for v in committee if v in self.targets]
-            
-            if targets_in_committee:
-                logger.info(f"[COMMITTEE] Epoch {e}: {len(targets_in_committee)} tracked sequencers in committee.")
-                self.processed_epochs.add(e)
-            
-            # Predict proposals
-            start_slot = e * self.config['epoch_duration']
-            end_slot = start_slot + self.config['epoch_duration']
-            
-            for s in range(start_slot, end_slot):
-                if s < current_slot: continue
-                
-                idx = compute_proposer_index(e, s, data['seed'], len(committee))
-                proposer = committee[idx]
-                
-                if proposer in self.targets:
-                    slot_ts = self.config['genesis_time'] + (s * self.config['slot_duration'])
-                    delta = max(0, slot_ts - now_ts)
-                    upcoming.append(f"{proposer[:6]}@Slot{s} (in {format_duration(delta)})")
+        summaries = []
 
-        if upcoming:
-            logger.info(f"[DUTY] Upcoming Proposals: {', '.join(upcoming)}")
+        for e in range(start_epoch, start_epoch + lookahead_epochs + 1):
+            data = self.get_epoch_data(e)
+            if not data or not data.get("committee"):
+                continue
+
+            committee = data["committee"]
+            start_slot = e * self.config["epoch_duration"]
+            end_slot = start_slot + self.config["epoch_duration"]
+
+            tracked_slots = []
+            for s in range(max(start_slot, current_slot), end_slot):
+                idx = compute_proposer_index(e, s, data["seed"], len(committee))
+                proposer = committee[idx]
+                if proposer in self.targets:
+                    tracked_slots.append(f"Slot{s}({proposer[:6]})")
+
+            if tracked_slots:
+                summaries.append(f"Epoch {e}: {', '.join(tracked_slots)}")
+
+        if summaries:
+            logger.info(f"[DUTY] Upcoming Proposals: {' | '.join(summaries)}")
 
     def run_scan(self, lookback_str: str):
         """Historical scan mode."""
@@ -419,6 +404,7 @@ class Aztecanary:
         self.check_validator_status()
         
         logger.info("Starting Real-time Monitor...")
+        last_slot: Optional[int] = None
         
         # Filter for L2BlockProposed
         event_filter = self.rollup.events.L2BlockProposed.create_filter(from_block='latest')
@@ -431,26 +417,27 @@ class Aztecanary:
                 # Calculate Aztec time
                 current_slot = (ts - self.config['genesis_time']) // self.config['slot_duration']
                 current_epoch = current_slot // self.config['epoch_duration']
-                
-                # Periodic Tasks
-                if current_l1['number'] % 10 == 0:
+
+                slot_changed = current_slot != last_slot
+
+                if slot_changed:
                     logger.info(f"[Heartbeat] L1: {current_l1['number']} | Epoch: {current_epoch} | Slot: {current_slot}")
-                
-                if current_l1['number'] % HEALTH_CHECK_INTERVAL_BLOCKS == 0:
                     self.check_validator_status()
-                
-                # Duty Prediction
-                self.predict_upcoming_duties(current_epoch, current_slot)
+                    if self.last_predicted_epoch != current_epoch:
+                        self.predict_upcoming_duties(current_epoch, current_slot)
+                        self.last_predicted_epoch = current_epoch
+                    self.check_missed_slots(current_slot)
+                    last_slot = current_slot
                 
                 # Process New Logs
                 new_entries = event_filter.get_new_entries()
                 for log in new_entries:
                     self.analyze_block_perf(log['args']['blockNumber'], log['transactionHash'])
-                
-                # Check for silence (missed slots)
-                self.check_missed_slots(current_slot)
-                
-                time.sleep(L1_BLOCK_TIME_SEC)
+                    
+                # Sleep until the next slot boundary to stay aligned with slot cadence
+                next_slot_ts = self.config['genesis_time'] + ((current_slot + 1) * self.config['slot_duration'])
+                sleep_for = max(0, next_slot_ts - time.time())
+                time.sleep(sleep_for)
                 
             except KeyboardInterrupt:
                 logger.info("Stopping...")

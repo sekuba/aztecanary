@@ -14,8 +14,7 @@ The script monitors specific Ethereum addresses (Sequencers) to ensure they are 
     *   `TARGETS`: Comma-separated list of validator addresses to monitor.
 *   **Constants**:
     *   `ROLLUP_ADDRESS`: `0x603bb2c05D474794ea97805e8De69bCcFb3bCA12`.
-    *   `L1_BLOCK_TIME`: Fixed at 12 seconds.
-    *   `HEALTH_CHECK_INTERVAL`: 50 L1 blocks.
+    *   `L1_BLOCK_TIME`: Fixed at 12 seconds (used for historical scan window math).
 
 ## 3. Core Logic & Math
 
@@ -44,13 +43,14 @@ Attestations are stored in a bitmap within the `propose` arguments.
 
 ### A. Real-Time Monitor (Default)
 Runs an infinite loop processing the L1 chain tip.
-1.  **Heartbeat**: Logs L1 block, Aztec Epoch/Slot every 10 blocks.
-2.  **Duty Prediction**: Calculates upcoming proposer slots for tracked targets based on the `lag` parameter and caches them.
-3.  **Event Processing**: Listens for `L2BlockProposed`. On event:
+1.  **Heartbeat**: Logs L1 block, Aztec Epoch/Slot once per slot (aligned to slot boundaries).
+2.  **Health Check**: Validator status is checked every slot; alerts fire on startup for non-`VALIDATING` or on any subsequent status change.
+3.  **Duty Prediction**: Once per epoch, logs tracked proposal duties for the current epoch plus the lookahead lag (e.g., 3 epochs total if `lag=2`).
+4.  **Event Processing**: Listens for `L2BlockProposed`. On event:
     *   Decodes the transaction.
     *   Verifies if the proposer was the expected one.
     *   Checks for missing attestations from tracked validators.
-4.  **Silence Detection**: If the L1 chain advances but no L2 block is seen for a slot assigned to a tracked sequencer, triggers a **PROPOSAL MISS** alert.
+5.  **Silence Detection**: If the L1 chain advances but no L2 block is seen for a slot assigned to a tracked sequencer, triggers a **PROPOSAL MISS** alert.
 
 ### B. Historical Scan (`-scan [value]`)
 Audits past performance over a defined range (e.g., `24h` or `100` blocks).
