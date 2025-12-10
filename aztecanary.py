@@ -9,6 +9,7 @@ Usage:
   python aztecanary.py              # Real-time monitoring
   python aztecanary.py -scan 100    # Scan last 100 L1 blocks
   python aztecanary.py -scan 24h    # Scan last 24 hours
+  python aztecanary.py -scan e984   # Scan only epoch 984
 """
 
 import os
@@ -27,16 +28,13 @@ from eth_utils import to_checksum_address
 RPC_URL = os.environ.get("RPC_URL", "http://127.0.0.1:8545")
 TARGETS_ENV = os.environ.get("TARGETS", "")
 ROLLUP_ADDRESS = "0x603bb2c05D474794ea97805e8De69bCcFb3bCA12"
+AGGREGATE3_SELECTOR = "0x82ad56cb"
 L1_BLOCK_TIME_SEC = 12
 PROPOSE_SELECTOR = "0x48aeda19"
-# Full propose param types (we only consume _signers)
-PROPOSE_PARAM_TYPES = [
-    "(bytes32,((bytes32,uint32),((bytes32,uint32),(bytes32,uint32),(bytes32,uint32))),(int256),(bytes32,(bytes32,bytes32,bytes32),uint256,uint256,address,bytes32,(uint128,uint128),uint256))",
-    "(bytes,bytes)",
-    "address[]",
-    "(uint8,bytes32,bytes32)",
-    "bytes",
-]
+# Hardcoded immutables (from deployed bytecode)
+GENESIS_TIME = 1762995155
+SLOT_DURATION = 72
+EPOCH_DURATION = 32
 
 # Minimal ABIs for interactions
 ROLLUP_ABI = [
@@ -53,7 +51,7 @@ ROLLUP_ABI = [
     {"inputs": [{"internalType": "uint256", "name": "_blockNumber", "type": "uint256"}], "name": "getBlock", "outputs": [{"components": [{"internalType": "bytes32", "name": "archive", "type": "bytes32"}, {"internalType": "bytes32", "name": "headerHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "blobCommitmentsHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "attestationsHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "payloadDigest", "type": "bytes32"}, {"internalType": "uint256", "name": "slotNumber", "type": "uint256"}, {"components": [{"internalType": "uint256", "name": "excessMana", "type": "uint256"}, {"internalType": "uint256", "name": "manaUsed", "type": "uint256"}, {"internalType": "uint256", "name": "feeAssetPriceNumerator", "type": "uint256"}, {"internalType": "uint256", "name": "congestionCost", "type": "uint256"}, {"internalType": "uint256", "name": "proverCost", "type": "uint256"}], "internalType": "struct FeeHeader", "name": "feeHeader", "type": "tuple"}], "internalType": "struct BlockLog", "name": "", "type": "tuple"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "getCurrentProposer", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "nonpayable", "type": "function"},
     # Propose Function (for decoding tx input)
-    {"inputs": [{"components": [{"components": [{"internalType": "uint256", "name": "slotNumber", "type": "uint256"}], "internalType": "struct ProposedHeader", "name": "header", "type": "tuple"}], "internalType": "struct ProposeArgs", "name": "_args", "type": "tuple"}, {"components": [{"internalType": "bytes", "name": "signatureIndices", "type": "bytes"}, {"internalType": "bytes", "name": "signaturesOrAddresses", "type": "bytes"}], "internalType": "struct CommitteeAttestations", "name": "_attestations", "type": "tuple"}, {"internalType": "address[]", "name": "_signers", "type": "address[]"}, {"components": [{"internalType": "uint8", "name": "v", "type": "uint8"}, {"internalType": "bytes32", "name": "r", "type": "bytes32"}, {"internalType": "bytes32", "name": "s", "type": "bytes32"}], "internalType": "struct ECDSAData", "name": "_attestationsAndSignersSignature", "type": "tuple"}, {"internalType": "bytes", "name": "_blobInput", "type": "bytes"}], "name": "propose", "type": "function"}
+    {"inputs": [{"components": [{"internalType": "bytes32", "name": "archive", "type": "bytes32"}, {"components": [{"components": [{"internalType": "bytes32", "name": "root", "type": "bytes32"}, {"internalType": "uint32", "name": "nextAvailableLeafIndex", "type": "uint32"}], "internalType": "struct PartialTreeRoot", "name": "l1ToL2MessageTree", "type": "tuple"}, {"components": [{"components": [{"internalType": "bytes32", "name": "root", "type": "bytes32"}, {"internalType": "uint32", "name": "nextAvailableLeafIndex", "type": "uint32"}], "internalType": "struct PartialTreeRoot", "name": "noteHashTree", "type": "tuple"}, {"components": [{"internalType": "bytes32", "name": "root", "type": "bytes32"}, {"internalType": "uint32", "name": "nextAvailableLeafIndex", "type": "uint32"}], "internalType": "struct PartialTreeRoot", "name": "nullifierTree", "type": "tuple"}, {"components": [{"internalType": "bytes32", "name": "root", "type": "bytes32"}, {"internalType": "uint32", "name": "nextAvailableLeafIndex", "type": "uint32"}], "internalType": "struct PartialTreeRoot", "name": "publicDataTree", "type": "tuple"}], "internalType": "struct PartialStateReference", "name": "partialStateReference", "type": "tuple"}], "internalType": "struct StateReference", "name": "stateReference", "type": "tuple"}, {"components": [{"internalType": "int256", "name": "feeAssetPriceModifier", "type": "int256"}], "internalType": "struct OracleInput", "name": "oracleInput", "type": "tuple"}, {"components": [{"internalType": "bytes32", "name": "lastArchiveRoot", "type": "bytes32"}, {"components": [{"internalType": "bytes32", "name": "blobsHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "inHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "outHash", "type": "bytes32"}], "internalType": "struct ContentCommitment", "name": "contentCommitment", "type": "tuple"}, {"internalType": "uint256", "name": "slotNumber", "type": "uint256"}, {"internalType": "uint256", "name": "timestamp", "type": "uint256"}, {"internalType": "address", "name": "coinbase", "type": "address"}, {"internalType": "bytes32", "name": "feeRecipient", "type": "bytes32"}, {"components": [{"internalType": "uint128", "name": "feePerDaGas", "type": "uint128"}, {"internalType": "uint128", "name": "feePerL2Gas", "type": "uint128"}], "internalType": "struct GasFees", "name": "gasFees", "type": "tuple"}, {"internalType": "uint256", "name": "totalManaUsed", "type": "uint256"}], "internalType": "struct Header", "name": "header", "type": "tuple"}], "internalType": "struct ProposeArgs", "name": "_args", "type": "tuple"}, {"components": [{"internalType": "bytes", "name": "signatureIndices", "type": "bytes"}, {"internalType": "bytes", "name": "signaturesOrAddresses", "type": "bytes"}], "internalType": "struct CommitteeAttestations", "name": "_attestations", "type": "tuple"}, {"internalType": "address[]", "name": "_signers", "type": "address[]"}, {"components": [{"internalType": "uint8", "name": "v", "type": "uint8"}, {"internalType": "bytes32", "name": "r", "type": "bytes32"}, {"internalType": "bytes32", "name": "s", "type": "bytes32"}], "internalType": "struct ECDSAData", "name": "_attestationsAndSignersSignature", "type": "tuple"}, {"internalType": "bytes", "name": "_blobInput", "type": "bytes"}], "name": "propose", "type": "function"}
 ]
 
 # Logging Setup
@@ -113,7 +111,7 @@ class Aztecanary:
         self.next_attest_ts: Optional[float] = None
 
     def init_chain_params(self):
-        """Fetches immutable chain parameters."""
+        """Initializes chain parameters (immutables are hardcoded)."""
         logger.info("Initializing chain parameters...")
         if not self.w3.is_connected():
             logger.error("Could not connect to RPC")
@@ -121,10 +119,10 @@ class Aztecanary:
 
         try:
             self.config = {
-                "genesis_time": self.rollup.functions.getGenesisTime().call(),
-                "slot_duration": self.rollup.functions.getSlotDuration().call(),
-                "epoch_duration": self.rollup.functions.getEpochDuration().call(),
-                "lag": self.rollup.functions.getLagInEpochs().call()
+                "genesis_time": GENESIS_TIME,
+                "slot_duration": SLOT_DURATION,
+                "epoch_duration": EPOCH_DURATION,
+                "lag": self.rollup.functions.getLagInEpochs().call(),
             }
             
             logger.info(f"Chain Params: EpochDur={self.config['epoch_duration']} slots, "
@@ -201,17 +199,40 @@ class Aztecanary:
 
     def _decode_propose_call(self, call_data: bytes) -> Optional[Dict]:
         """Decodes a propose call payload to extract signers and slot."""
-        if call_data[:4].hex() != PROPOSE_SELECTOR[2:]:
+        if len(call_data) < 4 or call_data[:4].hex() != PROPOSE_SELECTOR[2:]:
             return None
 
         try:
-            decoded = decode(PROPOSE_PARAM_TYPES, call_data[4:])
-            signers = [to_checksum_address(s) for s in decoded[2]]
-            # slotNumber is within header tuple (index 3), at position 2
-            slot_num = decoded[0][3][2]
+            data_hex = "0x" + call_data.hex()
+            fn, params = self.rollup.decode_function_input(data_hex)
+            if getattr(fn, "fn_name", "") != "propose":
+                return None
+
+            signers = [to_checksum_address(s) for s in params.get("_signers", [])]
+            slot_num = None
+
+            args_struct = params.get("_args")
+            if args_struct is not None:
+                header = args_struct.get("header") if hasattr(args_struct, "get") else None
+                if header is None and isinstance(args_struct, (list, tuple)) and args_struct:
+                    header = args_struct[3] if len(args_struct) >= 4 else args_struct[-1]
+                if header is not None:
+                    if hasattr(header, "get"):
+                        slot_num = header.get("slotNumber")
+                    elif isinstance(header, (list, tuple)) and header:
+                        # slotNumber is index 2 in the full header tuple (lastArchiveRoot, contentCommitment, slotNumber, ...)
+                        slot_num = header[2] if len(header) > 2 else header[-1]
+
+            if slot_num is None:
+                logger.error("decode_propose_call failure: slotNumber missing in decoded args")
+                return None
+
             return {"_signers": signers, "slot": slot_num}
         except Exception as e:
-            logger.error(f"decode_propose_call failure: {e}", exc_info=True)
+            prefix = call_data[:16].hex()
+            logger.error(
+                f"decode_propose_call failure: {e} | calldatalen={len(call_data)} prefix=0x{prefix}"
+            , exc_info=True)
             return None
 
     def decode_propose_tx(self, tx) -> Optional[Dict]:
@@ -219,20 +240,34 @@ class Aztecanary:
         Decodes a transaction to find the `propose` call arguments.
         Handles Multicall3 aggregate3 (0x82ad56cb) wrapping propose.
         """
-        input_hex = tx.input.hex()
-        raw_hex = input_hex[2:] if input_hex.startswith("0x") else input_hex
-        selector = f"0x{raw_hex[:8]}"
+        input_hex = tx.input if isinstance(tx.input, str) else tx.input.hex()
+        if not input_hex.startswith("0x"):
+            input_hex = "0x" + input_hex
 
-        # Multicall3 aggregate3
-        raw_data = bytes.fromhex(raw_hex[8:])  # strip selector (4 bytes)
-        decoded_calls = decode(['(address,bool,bytes)[]'], raw_data)[0]
+        selector = input_hex[:10]
+
+        if selector != AGGREGATE3_SELECTOR:
+            return None
+
+        try:
+            raw_data = bytes.fromhex(input_hex[10:])
+            decoded_calls = decode(['(address,bool,bytes)[]'], raw_data)[0]
+        except Exception as e:
+            logger.error(f"decode_propose_tx aggregate3 decode failure: {e}", exc_info=True)
+            return None
 
         for (target, _, call_data) in decoded_calls:
             if to_checksum_address(target) == ROLLUP_ADDRESS:
+                if len(call_data) < 4:
+                    logger.error(f"decode_propose_tx: call_data too short ({len(call_data)}) for rollup target in tx {tx.hash.hex()}")
+                    continue
+                inner_selector = call_data[:4].hex()
+                if inner_selector != PROPOSE_SELECTOR[2:]:
+                    logger.error(f"decode_propose_tx: unexpected inner selector 0x{inner_selector} for rollup target in tx {tx.hash.hex()}")
+                    continue
                 propose = self._decode_propose_call(call_data)
                 if propose:
                     return propose
-        logger.error(f"decode_propose_tx failure selector={selector} len={len(tx.input)} tx={tx.hash.hex()}", exc_info=True)
         return None
 
     def analyze_block_perf(self, l2_block_num: int, tx_hash: str, context: str = "REALTIME") -> Tuple[Optional[str], List[str], Optional[List[str]], List[str]]:
@@ -277,7 +312,7 @@ class Aztecanary:
             for _, validator in enumerate(committee):
                 if validator in self.targets:
                     if validator not in signers:
-                        logger.warning(f"[{context}] DUTY: ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}. txhash={tx_hash.hex()}")
+                        logger.warning(f"[{context}] DUTY: ATTEST_MISS - {validator[:8]} attestation not included for Block {l2_block_num} (committee member). txhash={tx_hash.hex()}")
                         missed_attesters.append(validator)
             
             return expected_proposer, missed_attesters, committee, signers
@@ -316,7 +351,7 @@ class Aztecanary:
         
         self.last_checked_slot = current_slot
 
-    def predict_upcoming_duties(self, start_epoch: int, current_slot: int):
+    def predict_upcoming_duties(self, start_epoch: int, current_slot: int, anchor_ts: int):
         """
         Logs proposal duties for tracked sequencers for current epoch plus lag
         and tracks the nearest duty for heartbeat display.
@@ -324,7 +359,7 @@ class Aztecanary:
         lookahead_epochs = self.config['lag']
         summaries = []
         nearest: Optional[Dict[str, Any]] = None
-        now_ts = time.time()
+        now_ts = anchor_ts
         attest_current = False
         next_attest_epoch: Optional[int] = None
         next_attest_ts: Optional[float] = None
@@ -383,26 +418,74 @@ class Aztecanary:
     def run_scan(self, lookback_str: str):
         """Historical scan mode."""
         self.init_chain_params()
+        target_epoch: Optional[int] = None
+        start_slot: Optional[int] = None
+        end_slot: Optional[int] = None
         
-        # Parse lookback (supports hours: h, days: d, epochs: e, or raw blocks)
+        # Parse lookback (supports hours: h, epochs lookback: e, specific epoch: e<number>, or raw blocks)
         blocks_to_scan = 0
-        look = lookback_str.lower()
-        if look.endswith("h"):
-            hours = int(look[:-1])
-            blocks_to_scan = (hours * 3600) // L1_BLOCK_TIME_SEC
-        elif look.endswith("e"):
-            epochs = int(look[:-1])
-            seconds = epochs * self.config["epoch_duration"] * self.config["slot_duration"]
-            blocks_to_scan = seconds // L1_BLOCK_TIME_SEC
-        else:
-            blocks_to_scan = int(lookback_str)
+        look = lookback_str.strip().lower()
 
-        current_l1 = self.w3.eth.block_number
-        from_block = max(0, current_l1 - blocks_to_scan)
+        latest_block = self.w3.eth.get_block('latest')
+        latest_num = latest_block['number']
+        latest_ts = latest_block['timestamp']
+
+        if look.startswith("e") and look[1:].isdigit():
+            target_epoch = int(look[1:])
+            epoch_seconds = self.config["epoch_duration"] * self.config["slot_duration"]
+            start_slot = target_epoch * self.config["epoch_duration"]
+            end_slot = start_slot + self.config["epoch_duration"]
+            start_ts = self.config["genesis_time"] + (start_slot * self.config["slot_duration"])
+            end_ts = start_ts + epoch_seconds
+
+            if start_ts > latest_ts:
+                logger.warning(f"Requested epoch {target_epoch} is in the future; nothing to scan.")
+                return
+
+            # Binary search for the first block with timestamp > start_ts, then step back one.
+            low, high = 0, latest_num
+            while low < high:
+                mid = (low + high) // 2
+                if self.w3.eth.get_block(mid)['timestamp'] <= start_ts:
+                    low = mid + 1
+                else:
+                    high = mid
+            start_block = max(0, low - 1)
+
+            # Binary search for the first block with timestamp >= end_ts; end_block is previous.
+            low, high = 0, latest_num
+            while low < high:
+                mid = (low + high) // 2
+                if self.w3.eth.get_block(mid)['timestamp'] < end_ts:
+                    low = mid + 1
+                else:
+                    high = mid
+            end_block = max(0, low - 1)
+
+            from_block = start_block
+            to_block = min(latest_num, end_block)
+
+            logger.info(
+                f"Scanning Epoch {target_epoch} (Slots {start_slot}-{end_slot - 1}) "
+                f"from L1 Block {from_block} to {to_block} "
+                f"(start_ts={start_ts}, end_ts={end_ts})"
+            )
+        else:
+            if look.endswith("h"):
+                hours = int(look[:-1])
+                blocks_to_scan = (hours * 3600) // L1_BLOCK_TIME_SEC
+            elif look.endswith("e"):
+                epochs = int(look[:-1])
+                seconds = epochs * self.config["epoch_duration"] * self.config["slot_duration"]
+                blocks_to_scan = seconds // L1_BLOCK_TIME_SEC
+            else:
+                blocks_to_scan = int(lookback_str)
+
+            from_block = max(0, latest_num - blocks_to_scan)
+            to_block = latest_num
+            logger.info(f"Starting Historical Scan from L1 Block {from_block} to {to_block} (~{blocks_to_scan} blocks)")
         
-        logger.info(f"Starting Historical Scan from L1 Block {from_block} to {current_l1} (~{blocks_to_scan} blocks)")
-        
-        logs = self.rollup.events.L2BlockProposed.get_logs(from_block=from_block, to_block=current_l1)
+        logs = self.rollup.events.L2BlockProposed.get_logs(from_block=from_block, to_block=to_block)
         logger.info(f"Found {len(logs)} L2 Blocks proposed in range.")
         
         validator_stats: Dict[str, Dict[str, int]] = {
@@ -412,8 +495,9 @@ class Aztecanary:
         observed_slots: Set[int] = set()
         missed_props = 0
         missed_attests = 0
-        min_slot = None
-        max_slot = None
+        processed_logs = 0
+        min_slot = start_slot
+        max_slot = end_slot - 1 if end_slot is not None else None
         
         for log in logs:
             l2_block = log['args']['blockNumber']
@@ -430,9 +514,15 @@ class Aztecanary:
                 logger.error(f"[HISTORY] Skipping block {l2_block}; slot unknown")
                 continue
 
+            block_epoch = slot // self.config['epoch_duration']
+            if target_epoch is not None and block_epoch != target_epoch:
+                continue
+
             observed_slots.add(slot)
-            min_slot = slot if min_slot is None else min(min_slot, slot)
-            max_slot = slot if max_slot is None else max(max_slot, slot)
+            processed_logs += 1
+            if target_epoch is None:
+                min_slot = slot if min_slot is None else min(min_slot, slot)
+                max_slot = slot if max_slot is None else max(max_slot, slot)
 
             expected, misses, committee, signers = self.analyze_block_perf(l2_block, log['transactionHash'], context="HISTORY")
             if misses:
@@ -468,11 +558,18 @@ class Aztecanary:
                     logger.warning(f"[HISTORY] DUTY:PROPOSAL_MISS - Slot {s} missed by tracked {expected_proposer}")
         
         logger.info("-" * 40)
-        logger.info(f"Scan Complete. Observed L2 Blocks: {len(logs)}")
+        logger.info(f"Scan Complete. Observed L2 Blocks: {processed_logs}")
         logger.info(f"Attestation Misses (Tracked): {missed_attests}")
         logger.info(f"Proposal Misses (Tracked): {missed_props}")
+        printed = False
         for val, stats in validator_stats.items():
+            total = sum(stats.values())
+            if total == 0:
+                continue
+            printed = True
             logger.info(f"[STATS] {val[:8]} proposals ok/miss: {stats['proposal_ok']}/{stats['proposal_miss']} | attests ok/miss: {stats['attest_ok']}/{stats['attest_miss']}")
+        if not printed:
+            logger.info("No tracked sequencer duties observed in this scan range.")
         logger.info("-" * 40)
 
     def run_realtime(self):
@@ -505,20 +602,20 @@ class Aztecanary:
                     )
 
                     if needs_prediction:
-                        self.predict_upcoming_duties(current_epoch, current_slot)
+                        self.predict_upcoming_duties(current_epoch, current_slot, ts)
                         self.last_predicted_epoch = current_epoch
 
                     # Proposal ETA
                     next_proposal = "N/A"
                     if self.next_duty_slot_ts is not None:
-                        next_proposal = format_duration(int(max(0, self.next_duty_slot_ts - time.time())))
+                        next_proposal = format_duration(int(max(0, self.next_duty_slot_ts - ts)))
 
                     # Attestation status/ETA
                     attest_info = "Attest: none"
                     if self.attest_current_epoch:
                         attest_info = "Attest: current epoch"
                     elif self.next_attest_ts is not None and self.next_attest_epoch is not None:
-                        attest_info = f"Attest in: {format_duration(int(max(0, self.next_attest_ts - time.time())))} (Epoch {self.next_attest_epoch})"
+                        attest_info = f"Attest in: {format_duration(int(max(0, self.next_attest_ts - ts)))} (Epoch {self.next_attest_epoch})"
 
                     logger.info(f"[Heartbeat] L1: {current_l1['number']} | Epoch: {current_epoch} | Slot: {current_slot} | Next proposal in: {next_proposal} | {attest_info}")
                     self.check_validator_status()
@@ -532,7 +629,7 @@ class Aztecanary:
                     
                 # Sleep until the next slot boundary to stay aligned with slot cadence
                 next_slot_ts = self.config['genesis_time'] + ((current_slot + 1) * self.config['slot_duration'])
-                sleep_for = max(0, next_slot_ts - time.time())
+                sleep_for = max(0, next_slot_ts - ts)
                 time.sleep(sleep_for)
                 
             except KeyboardInterrupt:
@@ -546,7 +643,7 @@ class Aztecanary:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Aztecanary Monitor")
-    parser.add_argument("-scan", help="Historical scan lookback (e.g., '100', '24h', '1d')", default=None)
+    parser.add_argument("-scan", help="Historical scan lookback (e.g., '100', '24h', '2e', 'e984')", default=None)
     args = parser.parse_args()
 
     targets = parse_targets(TARGETS_ENV)
