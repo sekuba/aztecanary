@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Aztecanary - Aztec Sequencer Monitor (Python 3.13)
+aztecanary - Aztec Sequencer Monitor (Python 3.13)
 Single-file, portable script to monitor Aztec L2 sequencers.
 
 Usage:
@@ -14,16 +14,13 @@ Usage:
 import os
 import sys
 import time
-import json
 import logging
 import argparse
-import re
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Set, Tuple, Any, Union
+from typing import Dict, List, Optional, Set, Tuple, Any
 
 from web3 import Web3
 from eth_abi import decode
-from eth_utils import to_checksum_address, keccak, to_bytes
+from eth_utils import to_checksum_address
 
 # --- Configuration & Constants ---
 
@@ -31,6 +28,15 @@ RPC_URL = os.environ.get("RPC_URL", "http://127.0.0.1:8545")
 TARGETS_ENV = os.environ.get("TARGETS", "")
 ROLLUP_ADDRESS = "0x603bb2c05D474794ea97805e8De69bCcFb3bCA12"
 L1_BLOCK_TIME_SEC = 12
+PROPOSE_SELECTOR = "0x48aeda19"
+# Full propose param types (we only consume _signers)
+PROPOSE_PARAM_TYPES = [
+    "(bytes32,((bytes32,uint32),((bytes32,uint32),(bytes32,uint32),(bytes32,uint32))),(int256),(bytes32,(bytes32,bytes32,bytes32),uint256,uint256,address,bytes32,(uint128,uint128),uint256))",
+    "(bytes,bytes)",
+    "address[]",
+    "(uint8,bytes32,bytes32)",
+    "bytes",
+]
 
 # Minimal ABIs for interactions
 ROLLUP_ABI = [
@@ -44,10 +50,10 @@ ROLLUP_ABI = [
     {"inputs": [{"internalType": "uint256", "name": "_epoch", "type": "uint256"}], "name": "getEpochCommittee", "outputs": [{"internalType": "address[]", "name": "", "type": "address[]"}], "stateMutability": "nonpayable", "type": "function"}, # Note: Non-view in source, but treated as view for data fetching usually
     {"inputs": [{"internalType": "uint256", "name": "_ts", "type": "uint256"}], "name": "getSampleSeedAt", "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"internalType": "address", "name": "_attester", "type": "address"}], "name": "getAttesterView", "outputs": [{"components": [{"internalType": "uint8", "name": "status", "type": "uint8"}, {"internalType": "uint256", "name": "effectiveBalance", "type": "uint256"}], "internalType": "struct AttesterView", "name": "", "type": "tuple"}], "stateMutability": "view", "type": "function"},
-    {"inputs": [{"internalType": "uint256", "name": "_blockNumber", "type": "uint256"}], "name": "getBlock", "outputs": [{"components": [{"internalType": "uint256", "name": "slotNumber", "type": "uint256"}], "internalType": "struct BlockLog", "name": "", "type": "tuple"}], "stateMutability": "view", "type": "function"},
+    {"inputs": [{"internalType": "uint256", "name": "_blockNumber", "type": "uint256"}], "name": "getBlock", "outputs": [{"components": [{"internalType": "bytes32", "name": "archive", "type": "bytes32"}, {"internalType": "bytes32", "name": "headerHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "blobCommitmentsHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "attestationsHash", "type": "bytes32"}, {"internalType": "bytes32", "name": "payloadDigest", "type": "bytes32"}, {"internalType": "uint256", "name": "slotNumber", "type": "uint256"}, {"components": [{"internalType": "uint256", "name": "excessMana", "type": "uint256"}, {"internalType": "uint256", "name": "manaUsed", "type": "uint256"}, {"internalType": "uint256", "name": "feeAssetPriceNumerator", "type": "uint256"}, {"internalType": "uint256", "name": "congestionCost", "type": "uint256"}, {"internalType": "uint256", "name": "proverCost", "type": "uint256"}], "internalType": "struct FeeHeader", "name": "feeHeader", "type": "tuple"}], "internalType": "struct BlockLog", "name": "", "type": "tuple"}], "stateMutability": "view", "type": "function"},
     {"inputs": [], "name": "getCurrentProposer", "outputs": [{"internalType": "address", "name": "", "type": "address"}], "stateMutability": "nonpayable", "type": "function"},
     # Propose Function (for decoding tx input)
-    {"inputs": [{"components": [{"components": [{"internalType": "uint256", "name": "slotNumber", "type": "uint256"}], "internalType": "struct ProposedHeader", "name": "header", "type": "tuple"}], "internalType": "struct ProposeArgs", "name": "_args", "type": "tuple"}, {"components": [{"internalType": "bytes", "name": "signatureIndices", "type": "bytes"}, {"internalType": "bytes", "name": "signaturesOrAddresses", "type": "bytes"}], "internalType": "struct CommitteeAttestations", "name": "_attestations", "type": "tuple"}, {"internalType": "address[]", "name": "_signers", "type": "address[]"}], "name": "propose", "type": "function"}
+    {"inputs": [{"components": [{"components": [{"internalType": "uint256", "name": "slotNumber", "type": "uint256"}], "internalType": "struct ProposedHeader", "name": "header", "type": "tuple"}], "internalType": "struct ProposeArgs", "name": "_args", "type": "tuple"}, {"components": [{"internalType": "bytes", "name": "signatureIndices", "type": "bytes"}, {"internalType": "bytes", "name": "signaturesOrAddresses", "type": "bytes"}], "internalType": "struct CommitteeAttestations", "name": "_attestations", "type": "tuple"}, {"internalType": "address[]", "name": "_signers", "type": "address[]"}, {"components": [{"internalType": "uint8", "name": "v", "type": "uint8"}, {"internalType": "bytes32", "name": "r", "type": "bytes32"}, {"internalType": "bytes32", "name": "s", "type": "bytes32"}], "internalType": "struct ECDSAData", "name": "_attestationsAndSignersSignature", "type": "tuple"}, {"internalType": "bytes", "name": "_blobInput", "type": "bytes"}], "name": "propose", "type": "function"}
 ]
 
 # Logging Setup
@@ -190,40 +196,45 @@ class Aztecanary:
             except Exception as e:
                 logger.error(f"Failed to check status for {target}: {e}")
 
+    def _decode_propose_call(self, call_data: bytes) -> Optional[Dict]:
+        """Decodes a propose call payload to extract signers."""
+        if call_data[:4].hex() != PROPOSE_SELECTOR[2:]:
+            return None
+
+        try:
+            decoded = decode(PROPOSE_PARAM_TYPES, call_data[4:])
+            signers = [to_checksum_address(s) for s in decoded[2]]
+            return {"_signers": signers}
+        except Exception as e:
+            logger.error(f"decode_propose_call failure: {e}", exc_info=True)
+            return None
+
     def decode_propose_tx(self, tx) -> Optional[Dict]:
         """
         Decodes a transaction to find the `propose` call arguments.
-        Handles direct calls and Multicall3.
+        Handles direct propose and Multicall3 aggregate3 (0x82ad56cb) wrapping propose.
         """
-        try:
-            # 1. Attempt Direct Decode
-            func_obj, decoded_args = self.rollup.decode_function_input(tx.input)
-            if func_obj.fn_name == "propose":
-                return decoded_args
-        except:
-            pass
+        input_hex = tx.input.hex()
+        selector = f"0x{input_hex[:8]}"
 
+        # Direct call
+        direct = self._decode_propose_call(bytes.fromhex(input_hex))
+        if direct:
+            return direct
+
+        # Multicall3 aggregate3
         try:
-            # 2. Attempt Multicall3 Decode
-            # Multicall aggregate3 signature: 0x82ad56cb
-            # aggregate3((address,bool,bytes)[])
-            if tx.input.hex().startswith("0x82ad56cb"):
-                # Decode the array of structs
-                # This is tricky without the full ABI object for Multicall, but we can try manual ABI decoding
-                # Input is (tuple[]) -> [(target, allowFailure, callData), ...]
-                raw_data = bytes.fromhex(tx.input.hex()[10:]) # remove selector
-                decoded = decode(['(address,bool,bytes)[]'], raw_data)[0]
-                
-                for (target, _, call_data) in decoded:
+            if selector == "0x82ad56cb":
+                raw_data = bytes.fromhex(input_hex[8:])  # strip selector (4 bytes)
+                decoded_calls = decode(['(address,bool,bytes)[]'], raw_data)[0]
+
+                for (target, _, call_data) in decoded_calls:
                     if to_checksum_address(target) == ROLLUP_ADDRESS:
-                        try:
-                            func_obj, decoded_args = self.rollup.decode_function_input(call_data)
-                            if func_obj.fn_name == "propose":
-                                return decoded_args
-                        except:
-                            continue
+                        propose = self._decode_propose_call(call_data)
+                        if propose:
+                            return propose
         except Exception:
-            pass
+            logger.error(f"decode_propose_tx failure selector={selector} len={len(tx.input)} tx={tx.hash.hex()}", exc_info=True)
             
         return None
 
@@ -233,21 +244,19 @@ class Aztecanary:
         Returns (ProposerAddress, List[MissedAttesters]).
         """
         try:
-            tx = self.w3.eth.get_transaction(tx_hash)
-            args = self.decode_propose_tx(tx)
-            
-            if not args:
-                return None, []
-
-            # Extract data
-            # Structure matches the ABI provided above
-            header = args['_args']['header']
-            attestations = args['_attestations']
-            signers = [to_checksum_address(s) for s in args['_signers']]
-            
-            slot = header['slotNumber']
+            block_view = self.rollup.functions.getBlock(l2_block_num).call()
+            slot = block_view[5]  # slotNumber
             self.processed_slots.add(slot)
 
+            tx = self.w3.eth.get_transaction(tx_hash)
+            args = self.decode_propose_tx(tx)
+            if not args:
+                logger.error(f"[{context}] Could not decode propose tx for L2 block {l2_block_num}; duty checks incomplete")
+                return None, []
+
+            # Extract from tx args and on-chain block view
+            signers = [to_checksum_address(s) for s in args['_signers']]
+            
             epoch = slot // self.config['epoch_duration']
             epoch_data = self.get_epoch_data(epoch)
             
@@ -266,8 +275,8 @@ class Aztecanary:
         
             missed_attesters = []
 
-            # Verify attestations using signer list
-            for i, validator in enumerate(committee):
+            # Verify attestations using signer list only
+            for _, validator in enumerate(committee):
                 if validator in self.targets:
                     if validator not in signers:
                         logger.warning(f"[{context}] DUTY:ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}")
