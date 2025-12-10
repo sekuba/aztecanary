@@ -70,8 +70,6 @@ logger.addHandler(handler)
 # --- Helper Functions ---
 
 def parse_targets(raw_targets: str) -> Set[str]:
-    if not raw_targets:
-        return set()
     return {to_checksum_address(t.strip()) for t in raw_targets.split(",") if t.strip()}
 
 def format_duration(seconds: int) -> str:
@@ -89,6 +87,9 @@ def compute_proposer_index(epoch: int, slot: int, seed: int, committee_size: int
 
 class Aztecanary:
     def __init__(self, targets: Set[str]):
+        if not targets:
+            logger.error("TARGETS is required. Set the TARGETS env var (comma-separated addresses).")
+            sys.exit(1)
         self.targets = targets
         self.w3 = Web3(Web3.HTTPProvider(RPC_URL))
         self.rollup = self.w3.eth.contract(address=ROLLUP_ADDRESS, abi=ROLLUP_ABI)
@@ -119,20 +120,16 @@ class Aztecanary:
                 "epoch_duration": EPOCH_DURATION,
                 "lag": self.rollup.functions.getLagInEpochs().call(),
             }
-            
+
             logger.info(f"Chain Params: EpochDur={self.config['epoch_duration']} slots, "
                         f"SlotDur={self.config['slot_duration']}s, Lag={self.config['lag']} epochs")
-            
-            if not self.targets:
-                logger.warning("No TARGETS configured. Monitoring passive chain health only.")
-            else:
-                logger.info(f"Tracking {len(self.targets)} sequencers: {', '.join(self.targets)}...")
-                
+            logger.info(f"Tracking {len(self.targets)} sequencers: {', '.join(self.targets)}...")
+
         except Exception as e:
             logger.error(f"Failed to initialize chain params: {e}")
             sys.exit(1)
 
-    def get_epoch_data(self, epoch: int) -> Optional[Dict]:
+    def get_epoch_data(self, epoch: int) -> Dict:
         """Fetches or retrieves cached committee and seed for an epoch."""
         if epoch in self.epoch_cache:
             return self.epoch_cache[epoch]
@@ -156,12 +153,10 @@ class Aztecanary:
             return data
         except Exception as e:
             logger.error(f"Failed to fetch data for Epoch {epoch}: {e}")
-            return None
+            sys.exit(1)
 
     def check_validator_status(self):
         """Polls the status of tracked validators."""
-        if not self.targets: return
-        
         status_map = {0: "NONE", 1: "VALIDATING", 2: "ZOMBIE", 3: "EXITING"}
         
         for target in self.targets:
@@ -256,9 +251,6 @@ class Aztecanary:
             epoch = slot // self.config['epoch_duration']
             epoch_data = self.get_epoch_data(epoch)
             
-            if not epoch_data or not epoch_data.get("committee"):
-                return None, [], None, []
-
             committee = epoch_data['committee']
             committee_size = len(committee)
 
@@ -303,9 +295,6 @@ class Aztecanary:
             
             epoch = s // self.config['epoch_duration']
             epoch_data = self.get_epoch_data(epoch)
-            if not epoch_data or not epoch_data['committee']:
-                continue
-                
             idx = compute_proposer_index(epoch, s, epoch_data['seed'], len(epoch_data['committee']))
             expected_proposer = epoch_data['committee'][idx]
             
@@ -329,9 +318,6 @@ class Aztecanary:
 
         for e in range(start_epoch, start_epoch + lookahead_epochs + 1):
             data = self.get_epoch_data(e)
-            if not data or not data.get("committee"):
-                continue
-
             committee = data["committee"]
             start_slot = e * self.config["epoch_duration"]
             end_slot = start_slot + self.config["epoch_duration"]
@@ -510,8 +496,6 @@ class Aztecanary:
                 
                 epoch = s // self.config['epoch_duration']
                 epoch_data = self.get_epoch_data(epoch)
-                if not epoch_data or not epoch_data['committee']:
-                    continue
 
                 proposer_idx = compute_proposer_index(epoch, s, epoch_data['seed'], len(epoch_data['committee']))
                 expected_proposer = epoch_data['committee'][proposer_idx]
@@ -611,7 +595,8 @@ if __name__ == "__main__":
 
     targets = parse_targets(TARGETS_ENV)
     if not targets:
-        logger.warning("No TARGETS environment variable set. Running in passive mode.")
+        logger.error("TARGETS is required. Set TARGETS env var (comma-separated addresses).")
+        sys.exit(1)
 
     canary = Aztecanary(targets)
 
