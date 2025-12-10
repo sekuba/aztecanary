@@ -86,14 +86,6 @@ def compute_proposer_index(epoch: int, slot: int, seed: int, committee_size: int
     packed = Web3.solidity_keccak(['uint256', 'uint256', 'uint256'], [epoch, slot, seed])
     return int.from_bytes(packed, byteorder='big') % committee_size
 
-def check_attestation_bit(signature_indices: bytes, index: int) -> bool:
-    """Checks if the bit at `index` is set in the signatureIndices byte array."""
-    byte_index = index // 8
-    shift = 7 - (index % 8)
-    if byte_index >= len(signature_indices):
-        return False
-    return (signature_indices[byte_index] >> shift) & 1 == 1
-
 # --- Main Logic Class ---
 
 class Aztecanary:
@@ -108,6 +100,8 @@ class Aztecanary:
         self.last_checked_slot: Optional[int] = None
         self.status_cache: Dict[str, str] = {}
         self.last_predicted_epoch: Optional[int] = None
+        self.next_duty_slot: Optional[int] = None
+        self.next_duty_slot_ts: Optional[float] = None
 
     def init_chain_params(self):
         """Fetches immutable chain parameters."""
@@ -130,7 +124,7 @@ class Aztecanary:
             if not self.targets:
                 logger.warning("No TARGETS configured. Monitoring passive chain health only.")
             else:
-                logger.info(f"Tracking {len(self.targets)} sequencers: {', '.join([t[:8] for t in self.targets])}...")
+                logger.info(f"Tracking {len(self.targets)} sequencers: {', '.join(self.targets)}...")
                 
         except Exception as e:
             logger.error(f"Failed to initialize chain params: {e}")
@@ -253,41 +247,29 @@ class Aztecanary:
             
             slot = header['slotNumber']
             self.processed_slots.add(slot)
-            
+
             epoch = slot // self.config['epoch_duration']
             epoch_data = self.get_epoch_data(epoch)
             
-            if not epoch_data:
+            if not epoch_data or not epoch_data.get("committee"):
                 return None, []
 
             committee = epoch_data['committee']
             committee_size = len(committee)
-            
-            # 1. Verify Proposer
-            expected_idx = compute_proposer_index(epoch, slot, epoch_data['seed'], committee_size)
-            expected_proposer = committee[expected_idx]
-            
-            # Resolve actual proposer from chain to be sure (or trust decoding)
-            # In JS we trusted chain resolution. Let's trust decoding but verify against expected.
-            # If they differ, it's a "Mismatch" error.
-            
-            missed_attesters = []
-            
-            if expected_proposer in self.targets:
-                logger.info(f"[{context}] DUTY:PROPOSAL_OK - Block {l2_block_num} (Slot {slot}) proposed by tracked {expected_proposer[:8]}")
 
-            # 2. Verify Attestations
-            # Valid attesters are those in `_signers` OR those with bit set in `signatureIndices`
-            
-            signature_indices = attestations['signatureIndices']
-            
+            expected_proposer = None
+            if committee_size > 0:
+                expected_idx = compute_proposer_index(epoch, slot, epoch_data['seed'], committee_size)
+                expected_proposer = committee[expected_idx]
+                if expected_proposer in self.targets:
+                    logger.info(f"[{context}] DUTY:PROPOSAL_OK - Block {l2_block_num} (Slot {slot}) proposed by tracked {expected_proposer[:8]}")
+        
+            missed_attesters = []
+
+            # Verify attestations using signer list
             for i, validator in enumerate(committee):
                 if validator in self.targets:
-                    did_attest = validator in signers
-                    if not did_attest:
-                        did_attest = check_attestation_bit(signature_indices, i)
-                    
-                    if not did_attest:
+                    if validator not in signers:
                         logger.warning(f"[{context}] DUTY:ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}")
                         missed_attesters.append(validator)
             
@@ -328,9 +310,14 @@ class Aztecanary:
         self.last_checked_slot = current_slot
 
     def predict_upcoming_duties(self, start_epoch: int, current_slot: int):
-        """Logs proposal duties for tracked sequencers for current epoch plus lag."""
+        """
+        Logs proposal duties for tracked sequencers for current epoch plus lag
+        and tracks the nearest duty for heartbeat display.
+        """
         lookahead_epochs = self.config['lag']
         summaries = []
+        nearest: Optional[Dict[str, Any]] = None
+        now_ts = time.time()
 
         for e in range(start_epoch, start_epoch + lookahead_epochs + 1):
             data = self.get_epoch_data(e)
@@ -341,15 +328,33 @@ class Aztecanary:
             start_slot = e * self.config["epoch_duration"]
             end_slot = start_slot + self.config["epoch_duration"]
 
-            tracked_slots = []
+            tracked_duties = []
             for s in range(max(start_slot, current_slot), end_slot):
                 idx = compute_proposer_index(e, s, data["seed"], len(committee))
                 proposer = committee[idx]
                 if proposer in self.targets:
-                    tracked_slots.append(f"Slot{s}({proposer[:6]})")
+                    slot_ts = self.config["genesis_time"] + (s * self.config["slot_duration"])
+                    delta = max(0, slot_ts - now_ts)
+                    duty = {"slot": s, "proposer": proposer, "delta": delta, "slot_ts": slot_ts}
+                    tracked_duties.append(duty)
+                    if nearest is None or duty["delta"] < nearest["delta"]:
+                        nearest = duty
 
-            if tracked_slots:
-                summaries.append(f"Epoch {e}: {', '.join(tracked_slots)}")
+            if tracked_duties:
+                formatted = []
+                for duty in tracked_duties:
+                    suffix = ""
+                    if nearest and duty["slot"] == nearest["slot"]:
+                        suffix = f" (in {format_duration(int(nearest['delta']))})"
+                    formatted.append(f"Slot {duty['slot']} ({duty['proposer'][:6]}){suffix}")
+                summaries.append(f"Epoch {e}: {', '.join(formatted)}")
+
+        if nearest:
+            self.next_duty_slot = nearest["slot"]
+            self.next_duty_slot_ts = nearest["slot_ts"]
+        else:
+            self.next_duty_slot = None
+            self.next_duty_slot_ts = None
 
         if summaries:
             logger.info(f"[DUTY] Upcoming Proposals: {' | '.join(summaries)}")
@@ -421,11 +426,22 @@ class Aztecanary:
                 slot_changed = current_slot != last_slot
 
                 if slot_changed:
-                    logger.info(f"[Heartbeat] L1: {current_l1['number']} | Epoch: {current_epoch} | Slot: {current_slot}")
-                    self.check_validator_status()
-                    if self.last_predicted_epoch != current_epoch:
+                    needs_prediction = (
+                        self.last_predicted_epoch != current_epoch or
+                        self.next_duty_slot is None or
+                        current_slot > self.next_duty_slot
+                    )
+
+                    if needs_prediction:
                         self.predict_upcoming_duties(current_epoch, current_slot)
                         self.last_predicted_epoch = current_epoch
+
+                    next_duty_in = "N/A"
+                    if self.next_duty_slot_ts is not None:
+                        next_duty_in = format_duration(int(max(0, self.next_duty_slot_ts - time.time())))
+
+                    logger.info(f"[Heartbeat] L1: {current_l1['number']} | Epoch: {current_epoch} | Slot: {current_slot} | Next duty in: {next_duty_in}")
+                    self.check_validator_status()
                     self.check_missed_slots(current_slot)
                     last_slot = current_slot
                 

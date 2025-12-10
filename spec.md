@@ -35,20 +35,19 @@ The script robustly identifies L2 blocks by decoding L1 transactions:
 2.  **Multicall3**: Parses `aggregate3` calls to find nested `rollup.propose` payloads.
 
 ### Attestation Verification
-Attestations are stored in a bitmap within the `propose` arguments.
-*   **Check**: For every tracked validator in the committee, the script checks if their specific bit is set in `signatureIndices`.
-*   **Alert**: If the bit is 0 and the validator address is not in the explicit `_signers` array, it is flagged as a missed attestation.
+For every tracked validator in the committee, the script checks presence in the `_signers` array of the proposal.
+*   **Alert**: If a tracked validator is absent from `_signers`, it is flagged as a missed attestation.
 
 ## 4. Operational Modes
 
 ### A. Real-Time Monitor (Default)
 Runs an infinite loop processing the L1 chain tip.
-1.  **Heartbeat**: Logs L1 block, Aztec Epoch/Slot once per slot (aligned to slot boundaries).
+1.  **Heartbeat**: Logs L1 block, Aztec Epoch/Slot once per slot (aligned to slot boundaries) and reports `Next duty in: <duration>` for the nearest upcoming tracked duty.
 2.  **Health Check**: Validator status is checked every slot; alerts fire on startup for non-`VALIDATING` or on any subsequent status change.
-3.  **Duty Prediction**: Once per epoch, logs tracked proposal duties for the current epoch plus the lookahead lag (e.g., 3 epochs total if `lag=2`).
+3.  **Duty Prediction**: Once per epoch (or when the nearest duty changes), logs tracked proposal duties for the current epoch plus the lookahead lag (e.g., 3 epochs total if `lag=2`), annotating the nearest duty with a human-readable time to go.
 4.  **Event Processing**: Listens for `L2BlockProposed`. On event:
-    *   Decodes the transaction.
-    *   Verifies if the proposer was the expected one.
+    *   Decodes the transaction and slot.
+    *   Assumes the proposal succeeded if the transaction landed; logs success for tracked proposers based on deterministic duty mapping.
     *   Checks for missing attestations from tracked validators.
 5.  **Silence Detection**: If the L1 chain advances but no L2 block is seen for a slot assigned to a tracked sequencer, triggers a **PROPOSAL MISS** alert.
 
