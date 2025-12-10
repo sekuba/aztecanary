@@ -218,22 +218,19 @@ class Aztecanary:
         Handles Multicall3 aggregate3 (0x82ad56cb) wrapping propose.
         """
         input_hex = tx.input.hex()
-        selector = f"0x{input_hex[:8]}"
+        raw_hex = input_hex[2:] if input_hex.startswith("0x") else input_hex
+        selector = f"0x{raw_hex[:8]}"
 
         # Multicall3 aggregate3
-        try:
-            if selector == "0x82ad56cb":
-                raw_data = bytes.fromhex(input_hex[8:])  # strip selector (4 bytes)
-                decoded_calls = decode(['(address,bool,bytes)[]'], raw_data)[0]
+        raw_data = bytes.fromhex(raw_hex[8:])  # strip selector (4 bytes)
+        decoded_calls = decode(['(address,bool,bytes)[]'], raw_data)[0]
 
-                for (target, _, call_data) in decoded_calls:
-                    if to_checksum_address(target) == ROLLUP_ADDRESS:
-                        propose = self._decode_propose_call(call_data)
-                        if propose:
-                            return propose
-        except Exception:
-            logger.error(f"decode_propose_tx failure selector={selector} len={len(tx.input)} tx={tx.hash.hex()}", exc_info=True)
-            
+        for (target, _, call_data) in decoded_calls:
+            if to_checksum_address(target) == ROLLUP_ADDRESS:
+                propose = self._decode_propose_call(call_data)
+                if propose:
+                    return propose
+        logger.error(f"decode_propose_tx failure selector={selector} len={len(tx.input)} tx={tx.hash.hex()}", exc_info=True)
         return None
 
     def analyze_block_perf(self, l2_block_num: int, tx_hash: str, context: str = "REALTIME") -> Tuple[Optional[str], List[str]]:
@@ -253,7 +250,7 @@ class Aztecanary:
                 return None, []
 
             # Extract from tx args and on-chain block view
-            signers = [to_checksum_address(s) for s in args['_signers']]
+            signers = args.get('_signers') or args.get('signers') or []
             
             epoch = slot // self.config['epoch_duration']
             epoch_data = self.get_epoch_data(epoch)
@@ -269,7 +266,7 @@ class Aztecanary:
                 expected_idx = compute_proposer_index(epoch, slot, epoch_data['seed'], committee_size)
                 expected_proposer = committee[expected_idx]
                 if expected_proposer in self.targets:
-                    logger.info(f"[{context}] DUTY:PROPOSAL_OK - Block {l2_block_num} (Slot {slot}) proposed by tracked {expected_proposer[:8]}")
+                    logger.info(f"[{context}] DUTY: PROPOSAL_OK - Block {l2_block_num} (Slot {slot}) proposed by tracked {expected_proposer[:8]}")
         
             missed_attesters = []
 
@@ -277,7 +274,7 @@ class Aztecanary:
             for _, validator in enumerate(committee):
                 if validator in self.targets:
                     if validator not in signers:
-                        logger.warning(f"[{context}] DUTY:ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}. txhash={tx_hash.hex()}")
+                        logger.warning(f"[{context}] DUTY: ATTEST_MISS - {validator[:8]} missed attestation for Block {l2_block_num}. txhash={tx_hash.hex()}")
                         missed_attesters.append(validator)
             
             return expected_proposer, missed_attesters
@@ -312,7 +309,7 @@ class Aztecanary:
             expected_proposer = epoch_data['committee'][idx]
             
             if expected_proposer in self.targets:
-                logger.warning(f"[REALTIME] DUTY:PROPOSAL_MISS - Slot {s} missed by tracked {expected_proposer}")
+                logger.warning(f"[REALTIME] DUTY: PROPOSAL_MISS - Slot {s} missed by tracked {expected_proposer}")
         
         self.last_checked_slot = current_slot
 
