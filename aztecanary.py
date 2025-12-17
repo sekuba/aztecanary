@@ -17,6 +17,7 @@ import sys
 import time
 import logging
 import argparse
+import subprocess
 from typing import Dict, List, Optional, Set, Tuple, Any
 
 from web3 import Web3
@@ -66,6 +67,26 @@ handler.setFormatter(CustomFormatter())
 logger = logging.getLogger("Aztecanary")
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
+
+class TelegramAlertHandler(logging.Handler):
+    def __init__(self, path: str = "/usr/local/bin/telegram"):
+        super().__init__(level=logging.WARNING)
+        self.path = path
+        self.fallback_formatter = logging.Formatter("%(asctime)s [ALERT] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    def emit(self, record: logging.LogRecord):
+        if record.levelno != logging.WARNING:
+            return
+        message = self.fallback_formatter.format(record)
+        try:
+            subprocess.run([self.path, message], check=False)
+        except Exception:
+            try:
+                print(f"Telegram alert failed to send: {message}", file=sys.stderr)
+            except Exception:
+                pass
+
+logger.addHandler(TelegramAlertHandler())
 
 # --- Helper Functions ---
 
