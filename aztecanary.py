@@ -127,6 +127,23 @@ class Aztecanary:
         self.next_attest_epoch: Optional[int] = None
         self.next_attest_ts: Optional[float] = None
 
+    @staticmethod
+    def _is_filter_not_found_error(err: BaseException) -> bool:
+        if not isinstance(err, ValueError) or not err.args:
+            return False
+        payload = err.args[0]
+        if not isinstance(payload, dict):
+            return False
+        code = payload.get("code")
+        message = str(payload.get("message", "")).lower()
+        return code == -32000 and "filter not found" in message
+
+    def _create_l2_block_proposed_filter(self, from_block: int):
+        return self.rollup.events.L2BlockProposed.create_filter(from_block=from_block)
+
+    def _get_l2_block_proposed_logs(self, from_block: int, to_block: int):
+        return self.rollup.events.L2BlockProposed.get_logs(from_block=from_block, to_block=to_block)
+
     def init_chain_params(self):
         """Initializes chain parameters (immutables are hardcoded)."""
         logger.info("Initializing chain parameters...")
@@ -547,9 +564,15 @@ class Aztecanary:
         
         logger.info("Starting Real-time Monitor...")
         last_slot: Optional[int] = None
-        
-        # Filter for L2BlockProposed
-        event_filter = self.rollup.events.L2BlockProposed.create_filter(from_block='latest')
+
+        poll_interval_sec = 6
+        last_processed_l1_block = self.w3.eth.block_number
+
+        event_filter = None
+        try:
+            event_filter = self._create_l2_block_proposed_filter(from_block=last_processed_l1_block)
+        except Exception as e:
+            logger.warning(f"Unable to create event filter; falling back to get_logs polling: {e}")
         
         while True:
             try:
@@ -591,13 +614,40 @@ class Aztecanary:
                     last_slot = current_slot
                 
                 # Process New Logs
-                new_entries = event_filter.get_new_entries()
-                for log in new_entries:
-                    self.analyze_block_perf(log['args']['blockNumber'], log['transactionHash'])
+                latest_l1_block = current_l1["number"]
+                if event_filter is not None:
+                    try:
+                        new_entries = event_filter.get_new_entries()
+                    except ValueError as e:
+                        if self._is_filter_not_found_error(e):
+                            logger.warning("Event filter expired (filter not found); recreating filter.")
+                            try:
+                                event_filter = self._create_l2_block_proposed_filter(from_block=last_processed_l1_block + 1)
+                                new_entries = []
+                            except Exception as recreate_err:
+                                logger.warning(f"Unable to recreate event filter; falling back to get_logs polling: {recreate_err}")
+                                event_filter = None
+                                new_entries = []
+                        else:
+                            logger.warning(f"Event filter error; falling back to get_logs polling: {e}")
+                            event_filter = None
+                            new_entries = []
+                    for log in new_entries:
+                        last_processed_l1_block = max(last_processed_l1_block, int(log.get("blockNumber", latest_l1_block)))
+                        self.analyze_block_perf(log["args"]["blockNumber"], log["transactionHash"])
+                else:
+                    if latest_l1_block > last_processed_l1_block:
+                        logs = self._get_l2_block_proposed_logs(
+                            from_block=last_processed_l1_block + 1,
+                            to_block=latest_l1_block,
+                        )
+                        for log in logs:
+                            self.analyze_block_perf(log["args"]["blockNumber"], log["transactionHash"])
+                        last_processed_l1_block = latest_l1_block
                     
-                # Sleep until the next slot boundary to stay aligned with slot cadence
+                # Sleep until the next slot boundary but poll often enough to keep RPC filters alive
                 next_slot_ts = self.config['genesis_time'] + ((current_slot + 1) * self.config['slot_duration'])
-                sleep_for = max(0, next_slot_ts - ts)
+                sleep_for = min(poll_interval_sec, max(0, next_slot_ts - ts))
                 time.sleep(sleep_for)
                 
             except KeyboardInterrupt:
